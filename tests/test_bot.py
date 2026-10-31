@@ -1,14 +1,36 @@
+import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
 
+import bot as bot_module
 import scam_filter
-from bot import ModeratorBot, Settings, format_minutes, shorten, transcript
+from bot import LogChannelStore, ModeratorBot, Settings, format_minutes, shorten, transcript
 from tests.test_scam_filter import encode, sample_image
+
+
+def text_channel(send, channel_id=999, guild_id=1):
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id = channel_id
+    channel.guild = SimpleNamespace(id=guild_id)
+    channel.mention = f"<#{channel_id}>"
+    channel.send = send
+    return channel
+
+
+def make_bot(test, send, **settings):
+    """A bot whose server 1 logs to channel 999, with settings saved in a temp folder."""
+    folder = tempfile.TemporaryDirectory()
+    test.addCleanup(folder.cleanup)
+    bot = ModeratorBot(Settings("unused", data_dir=Path(folder.name), **settings))
+    channel = text_channel(send)
+    bot.get_channel = MagicMock(side_effect=lambda cid: channel if cid == channel.id else None)
+    bot.store.channels = {1: 999}
+    return bot, channel
 
 
 def message(message_id=10, content="A deleted message"):
@@ -23,28 +45,28 @@ def message(message_id=10, content="A deleted message"):
 
 class SettingsTests(unittest.TestCase):
     def test_valid_config_and_defaults(self):
-        settings = Settings.from_env({"DISCORD_TOKEN": "secret", "DISCORD_LOG_CHANNEL_ID": "123"})
-        self.assertEqual(settings.log_channel_id, 123)
+        settings = Settings.from_env({"DISCORD_TOKEN": "secret"})
         self.assertEqual(settings.cache_size, 10_000)
+        self.assertEqual(settings.data_dir, bot_module.BASE_DIR / "data")
+        self.assertFalse(hasattr(settings, "log_channel_id"))
 
     def test_rejects_missing_placeholder_and_invalid_config(self):
         for env in (
             {},
             {"DISCORD_TOKEN": "replace_with_your_bot_token"},
-            {"DISCORD_TOKEN": "secret", "DISCORD_LOG_CHANNEL_ID": "abc"},
-            {"DISCORD_TOKEN": "secret", "DISCORD_LOG_CHANNEL_ID": "0"},
-            {"DISCORD_TOKEN": "secret", "DISCORD_LOG_CHANNEL_ID": "1", "MESSAGE_CACHE_SIZE": "-1"},
+            {"DISCORD_TOKEN": "secret", "MESSAGE_CACHE_SIZE": "abc"},
+            {"DISCORD_TOKEN": "secret", "MESSAGE_CACHE_SIZE": "-1"},
         ):
             with self.subTest(env=env), self.assertRaises(ValueError):
                 Settings.from_env(env)
 
     def test_scam_settings_defaults_and_overrides(self):
-        base = {"DISCORD_TOKEN": "secret", "DISCORD_LOG_CHANNEL_ID": "123"}
+        base = {"DISCORD_TOKEN": "secret"}
         settings = Settings.from_env(base)
         self.assertEqual(settings.scam_action, "timeout")
         self.assertEqual(settings.timeout_minutes, 1440)
         self.assertEqual(settings.blocked_domains, ("wispwin.com",))
-        self.assertEqual(settings.scam_images_dir, Path("scam-images"))
+        self.assertEqual(settings.scam_images_dir, bot_module.BASE_DIR / "scam-images")
         settings = Settings.from_env(
             base
             | {
@@ -58,10 +80,11 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.scam_action, "ban")
         self.assertEqual(settings.blocked_domains, ("a.com", "b.net"))
         self.assertEqual(settings.repeat_channels, 0)
+        self.assertEqual(settings.scam_images_dir, Path("/tmp/x"))
         self.assertEqual(Settings.from_env(base | {"BLOCKED_DOMAINS": ""}).blocked_domains, ())
 
     def test_rejects_invalid_scam_settings(self):
-        base = {"DISCORD_TOKEN": "secret", "DISCORD_LOG_CHANNEL_ID": "123"}
+        base = {"DISCORD_TOKEN": "secret"}
         for extra in (
             {"SCAM_ACTION": "explode"},
             {"SCAM_TIMEOUT_MINUTES": "0"},
@@ -97,7 +120,6 @@ class SettingsTests(unittest.TestCase):
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.bot = ModeratorBot(Settings("unused", 999))
         self.sent = []
 
         async def send(**kwargs):
@@ -109,7 +131,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
 
-        self.bot.log_channel = SimpleNamespace(id=999, guild=SimpleNamespace(id=1), send=send)
+        self.bot, self.channel = make_bot(self, send)
 
     async def asyncTearDown(self):
         await self.bot.close()
@@ -152,30 +174,154 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             (1, 2, set()),
         ):
             await self.bot.log_deletion(guild_id, channel_id, ids, {})
-        self.bot.log_channel = None
+        self.bot.store.channels = {}  # no log channel set
+        await self.bot.log_deletion(1, 2, {10}, {})
+        self.bot.store.channels = {1: 12345}  # channel was deleted
         await self.bot.log_deletion(1, 2, {10}, {})
         self.assertEqual(self.sent, [])
 
     async def test_send_failure_is_reported_without_crashing_handler(self):
         response = SimpleNamespace(status=403, reason="Forbidden")
-        self.bot.log_channel.send = AsyncMock(side_effect=discord.Forbidden(response, "Denied"))
+        self.channel.send = AsyncMock(side_effect=discord.Forbidden(response, "Denied"))
         with self.assertLogs("bot", level="ERROR") as captured:
             await self.bot.log_deletion(1, 2, {10}, {10: message(content="private content")})
         self.assertIn("Could not log", captured.output[0])
         self.assertNotIn("private content", captured.output[0])
 
-    async def test_startup_rejects_missing_permissions(self):
-        channel = MagicMock(spec=discord.TextChannel)
-        channel.guild.me = object()
-        channel.permissions_for.return_value = SimpleNamespace(
+    async def test_startup_warns_about_problems_without_stopping(self):
+        guild = SimpleNamespace(
+            id=1,
+            me=SimpleNamespace(
+                guild_permissions=SimpleNamespace(manage_messages=True, moderate_members=False)
+            ),
+        )
+        gone = SimpleNamespace(id=2, me=None)
+        self.channel.permissions_for.return_value = SimpleNamespace(
             view_channel=True, send_messages=True, embed_links=True, attach_files=False
         )
-        self.bot.get_channel = MagicMock(return_value=channel)
+        self.bot.store.channels = {1: 999, 2: 555}
         self.bot.close = AsyncMock()
-        with self.assertLogs("bot", level="ERROR") as captured:
+        with (
+            patch.object(type(self.bot), "guilds", new_callable=PropertyMock) as guilds,
+            self.assertLogs("bot", level="WARNING") as captured,
+        ):
+            guilds.return_value = [guild, gone]
             await self.bot.on_ready()
-        self.bot.close.assert_awaited_once()
-        self.assertIn("attach_files", captured.output[0])
+        self.bot.close.assert_not_awaited()
+        output = "\n".join(captured.output)
+        self.assertIn("attach_files", output)
+        self.assertIn("moderate_members", output)
+        self.assertIn("555 is gone", output)
+
+
+class LogChannelStoreTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "data" / "log_channels.json"
+
+    def test_saves_and_reloads_per_server_channels(self):
+        store = LogChannelStore(self.path)
+        self.assertEqual(store.channels, {})
+        store.set(1, 100)
+        store.set(2, 200)
+        store.set(1, 101)
+        self.assertEqual(LogChannelStore(self.path).channels, {1: 101, 2: 200})
+        store.set(2, None)
+        self.assertEqual(LogChannelStore(self.path).channels, {1: 101})
+
+    def test_unreadable_file_is_reported(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("not json")
+        with self.assertRaises(ValueError):
+            LogChannelStore(self.path)
+
+
+def interaction(guild_id=1):
+    guild = SimpleNamespace(
+        id=guild_id,
+        me=SimpleNamespace(
+            guild_permissions=SimpleNamespace(manage_messages=True, moderate_members=True)
+        ),
+    )
+    return SimpleNamespace(
+        guild=guild,
+        guild_id=guild_id,
+        user="admin",
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+
+ALL_LOG_PERMISSIONS = SimpleNamespace(
+    view_channel=True, send_messages=True, embed_links=True, attach_files=True
+)
+
+
+class LogChannelCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.bot, self.channel = make_bot(self, AsyncMock())
+        self.bot.store.channels = {}
+        self.commands = self.bot.tree.get_command("logchannel")
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def answer(self, action):
+        action.response.send_message.assert_awaited_once()
+        call = action.response.send_message.await_args
+        self.assertTrue(call.kwargs["ephemeral"])
+        return call.args[0]
+
+    async def run_command(self, name, action, *args):
+        await self.commands.get_command(name).callback(self.commands, action, *args)
+
+    def test_only_server_managers_see_the_command(self):
+        data = self.commands.to_dict(self.bot.tree)
+        self.assertEqual(int(data["default_member_permissions"]), 32)  # Manage Server
+        self.assertFalse(data["dm_permission"])
+
+    async def test_set_saves_channel_and_posts_confirmation(self):
+        self.channel.permissions_for.return_value = ALL_LOG_PERMISSIONS
+        action = interaction()
+        await self.run_command("set", action, self.channel)
+        self.channel.send.assert_awaited_once()
+        self.assertIn("<#999>", self.answer(action))
+        self.assertEqual(LogChannelStore(self.bot.store.path).channels, {1: 999})
+        self.assertIs(self.bot.log_channel_for(1), self.channel)
+
+    async def test_set_refuses_channel_without_permissions(self):
+        self.channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True, send_messages=False, embed_links=True, attach_files=True
+        )
+        action = interaction()
+        await self.run_command("set", action, self.channel)
+        self.assertIn("send_messages", self.answer(action))
+        self.channel.send.assert_not_awaited()
+        self.assertEqual(self.bot.store.channels, {})
+
+    async def test_set_reports_failed_test_post(self):
+        self.channel.permissions_for.return_value = ALL_LOG_PERMISSIONS
+        response = SimpleNamespace(status=403, reason="Forbidden")
+        self.channel.send = AsyncMock(side_effect=discord.Forbidden(response, "Denied"))
+        action = interaction()
+        await self.run_command("set", action, self.channel)
+        self.assertIn("HTTP 403", self.answer(action))
+        self.assertEqual(self.bot.store.channels, {})
+
+    async def test_show_and_off(self):
+        action = interaction()
+        await self.run_command("show", action)
+        self.assertIn("No log channel", self.answer(action))
+
+        self.bot.store.set(1, 999)
+        action = interaction()
+        await self.run_command("show", action)
+        self.assertIn("<#999>", self.answer(action))
+
+        action = interaction()
+        await self.run_command("off", action)
+        self.assertIn("off", self.answer(action))
+        self.assertEqual(LogChannelStore(self.bot.store.path).channels, {})
 
 
 def member(member_id=42, moderator=False, bot=False):
@@ -185,7 +331,7 @@ def member(member_id=42, moderator=False, bot=False):
     author.guild_permissions = SimpleNamespace(manage_messages=moderator)
     author.timeout = AsyncMock()
     author.kick = AsyncMock()
-    author.guild = SimpleNamespace(ban=AsyncMock())
+    author.guild = SimpleNamespace(id=1, ban=AsyncMock())
     author.__str__.return_value = "spammer"
     return author
 
@@ -217,9 +363,6 @@ def post(author, message_id=10, channel_id=2, content="", attachments=(), guild_
 
 class ScamFilterBotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.bot = ModeratorBot(Settings("unused", 999, scam_images_dir=Path("/nonexistent")))
-        self.scam_png = encode(sample_image(1))
-        self.bot.known_images[scam_filter.image_hash(self.scam_png)] = "test scam"
         self.sent = []
 
         async def send(**kwargs):
@@ -227,7 +370,9 @@ class ScamFilterBotTests(unittest.IsolatedAsyncioTestCase):
                 {"embed": kwargs["embed"], "text": kwargs["file"].fp.read().decode("utf-8")}
             )
 
-        self.bot.log_channel = SimpleNamespace(id=999, guild=SimpleNamespace(id=1), send=send)
+        self.bot, _ = make_bot(self, send, scam_images_dir=Path("/nonexistent"))
+        self.scam_png = encode(sample_image(1))
+        self.bot.known_images[scam_filter.image_hash(self.scam_png)] = "test scam"
 
     async def asyncTearDown(self):
         await self.bot.close()
@@ -336,12 +481,12 @@ class ScamFilterBotTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("bot", level="WARNING"):
             await self.bot.on_message(post(author, attachments=[attachment(self.scam_png)]))
         self.assertIn("Timeout failed (HTTP 403)", str(self.sent[0]["embed"].fields))
-        self.assertNotIn(author.id, self.bot.actioned)  # a later copy may retry
+        self.assertNotIn((1, author.id), self.bot.actioned)  # a later copy may retry
 
     async def test_other_actions(self):
         for action in ("none", "kick", "ban"):
             with self.subTest(action=action):
-                self.bot.settings = Settings("unused", 999, scam_action=action)
+                self.bot.settings = Settings("unused", scam_action=action)
                 self.bot.actioned.clear()
                 author = member()
                 await self.bot.on_message(post(author, attachments=[attachment(self.scam_png)]))

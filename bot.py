@@ -1,9 +1,10 @@
-"""Log message deletions and remove scam posts in one Discord server."""
+"""Log message deletions and remove scam posts in Discord servers."""
 
 from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 from collections.abc import Mapping
@@ -14,12 +15,16 @@ from pathlib import Path
 
 import aiohttp
 import discord
+from discord import app_commands
 from dotenv import load_dotenv
 
 import scam_filter
 
 log = logging.getLogger(__name__)
 
+# Relative paths are resolved from the bot's folder, so it starts the same way
+# whatever directory a hosting panel launches it from.
+BASE_DIR = Path(__file__).resolve().parent
 
 SCAM_ACTIONS = ("none", "timeout", "kick", "ban")
 MODERATION_PERMISSIONS = {
@@ -29,34 +34,44 @@ MODERATION_PERMISSIONS = {
     "ban": ("ban_members",),
 }
 MAX_TIMEOUT_MINUTES = 28 * 24 * 60  # Discord's limit
+LOG_CHANNEL_PERMISSIONS = ("view_channel", "send_messages", "embed_links", "attach_files")
+
+
+def resolve(path: str | Path) -> Path:
+    path = Path(path).expanduser()
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def missing_permissions(permissions: discord.Permissions, names: tuple[str, ...]) -> list[str]:
+    return [name for name in names if not getattr(permissions, name)]
 
 
 @dataclass(frozen=True)
 class Settings:
     token: str
-    log_channel_id: int
     cache_size: int = 10_000
     scam_action: str = "timeout"
     timeout_minutes: int = 24 * 60
     image_match_distance: int = 40
     blocked_domains: tuple[str, ...] = scam_filter.DEFAULT_BLOCKED_DOMAINS
-    scam_images_dir: Path = field(default_factory=lambda: Path("scam-images"))
+    scam_images_dir: Path = field(default_factory=lambda: BASE_DIR / "scam-images")
     repeat_channels: int = 3
+    data_dir: Path = field(default_factory=lambda: BASE_DIR / "data")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
         token = env.get("DISCORD_TOKEN", "").strip()
         if not token or token == "replace_with_your_bot_token":
-            raise ValueError("Set DISCORD_TOKEN in .env to your Discord bot token.")
+            raise ValueError(
+                "Set DISCORD_TOKEN to your Discord bot token, either in a .env file or in "
+                "your host's environment variables."
+            )
         try:
-            channel_id = int(env.get("DISCORD_LOG_CHANNEL_ID", ""))
             cache_size = int(env.get("MESSAGE_CACHE_SIZE", "10000"))
         except ValueError as exc:
-            raise ValueError(
-                "DISCORD_LOG_CHANNEL_ID and MESSAGE_CACHE_SIZE must be integers."
-            ) from exc
-        if channel_id <= 0 or cache_size <= 0:
-            raise ValueError("DISCORD_LOG_CHANNEL_ID and MESSAGE_CACHE_SIZE must be positive.")
+            raise ValueError("MESSAGE_CACHE_SIZE must be an integer.") from exc
+        if cache_size <= 0:
+            raise ValueError("MESSAGE_CACHE_SIZE must be positive.")
 
         action = env.get("SCAM_ACTION", "timeout").strip().lower()
         if action not in SCAM_ACTIONS:
@@ -84,15 +99,43 @@ class Settings:
         )
         return cls(
             token,
-            channel_id,
             cache_size,
             scam_action=action,
             timeout_minutes=timeout_minutes,
             image_match_distance=distance,
             blocked_domains=blocked,
-            scam_images_dir=Path(env.get("SCAM_IMAGES_DIR", "scam-images")),
+            scam_images_dir=resolve(env.get("SCAM_IMAGES_DIR") or "scam-images"),
             repeat_channels=repeat_channels,
+            data_dir=resolve(env.get("DATA_DIR") or "data"),
         )
+
+
+class LogChannelStore:
+    """Each server's log channel, chosen with /logchannel set and saved to a JSON file."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.channels: dict[int, int] = {}
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            self.channels = {int(k): int(v) for k, v in raw.items()}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Cannot read saved log channels from {path}: {exc}") from exc
+
+    def set(self, guild_id: int, channel_id: int | None) -> None:
+        """Save a server's channel, or forget it when channel_id is None."""
+        channels = dict(self.channels)
+        if channel_id is None:
+            channels.pop(guild_id, None)
+        else:
+            channels[guild_id] = channel_id
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_suffix(".tmp")
+        temp.write_text(json.dumps({str(k): v for k, v in channels.items()}, indent=2), "utf-8")
+        os.replace(temp, self.path)  # atomic, so a crash never leaves a half-written file
+        self.channels = channels
 
 
 def shorten(text: str, limit: int) -> str:
@@ -153,47 +196,80 @@ class ModeratorBot(discord.Client):
             allowed_mentions=discord.AllowedMentions.none(),
         )
         self.settings = settings
-        self.log_channel: discord.TextChannel | None = None
+        self.store = LogChannelStore(settings.data_dir / "log_channels.json")
         self.known_images = dict(scam_filter.KNOWN_SCAM_IMAGES)
         self.known_images.update(scam_filter.load_image_dir(settings.scam_images_dir))
         self.blocked_domains = scam_filter.domain_pattern(settings.blocked_domains)
         self.repeats = scam_filter.RepeatTracker(settings.repeat_channels)
         # Messages this bot deleted; they get a scam log instead of a deletion log.
         self.removed_ids: set[int] = set()
-        self.actioned: dict[int, datetime] = {}
+        # (server ID, member ID) -> when the scam action was applied.
+        self.actioned: dict[tuple[int, int], datetime] = {}
+        self.tree = app_commands.CommandTree(self)
+        self.tree.add_command(LogChannelCommands(self))
+
+    async def setup_hook(self) -> None:
+        try:
+            await self.tree.sync()
+        except discord.HTTPException:
+            # Logging keeps working with commands registered by an earlier start.
+            log.exception("Could not register the /logchannel command with Discord")
+
+    def log_channel_for(self, guild_id: int | None) -> discord.TextChannel | None:
+        """The server's log channel, if one was set and the bot can still see it."""
+        if guild_id is None or (channel_id := self.store.channels.get(guild_id)) is None:
+            return None
+        channel = self.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel) and channel.guild.id == guild_id:
+            return channel
+        return None
+
+    def server_permission_problems(self, guild: discord.Guild) -> list[str]:
+        """Server-wide permissions the scam filter needs but the bot lacks."""
+        if guild.me is None:
+            return []
+        needed = ("manage_messages", *MODERATION_PERMISSIONS[self.settings.scam_action])
+        return missing_permissions(guild.me.guild_permissions, needed)
 
     async def on_ready(self) -> None:
-        try:
-            channel = self.get_channel(self.settings.log_channel_id)
+        # Problems here are logged, not fatal: admins fix them with /logchannel set.
+        log.info("Logged in as %s in %s server(s)", self.user, len(self.guilds))
+        active = 0
+        for guild in self.guilds:
+            channel_id = self.store.channels.get(guild.id)
+            if channel_id is None:
+                continue
+            channel = self.log_channel_for(guild.id)
             if channel is None:
-                channel = await self.fetch_channel(self.settings.log_channel_id)
-            if not isinstance(channel, discord.TextChannel):
-                raise ValueError("DISCORD_LOG_CHANNEL_ID must identify a server text channel.")
-            member = channel.guild.me
-            if member is None:
-                raise ValueError("The bot must be a member of the log channel's server.")
-            permissions = channel.permissions_for(member)
-            required = ("view_channel", "send_messages", "embed_links", "attach_files")
-            missing = [name for name in required if not getattr(permissions, name)]
-            if missing:
-                raise ValueError(f"Missing log-channel permissions: {', '.join(missing)}")
-            self.log_channel = channel
-            log.info(
-                "Logged in as %s; logging deletions to #%s (%s)", self.user, channel, channel.id
-            )
-            log.info(
-                "Scam filter: %s known images, %s blocked domains, action=%s",
-                len(self.known_images),
-                len(self.settings.blocked_domains),
-                self.settings.scam_action,
-            )
-            needed = ["manage_messages", *MODERATION_PERMISSIONS[self.settings.scam_action]]
-            missing = [name for name in needed if not getattr(member.guild_permissions, name)]
-            if missing:
-                log.warning("Scam removal needs these server permissions: %s", ", ".join(missing))
-        except (discord.HTTPException, ValueError):
-            log.exception("Cannot initialize the moderator log channel; stopping.")
-            await self.close()
+                log.warning(
+                    "Server %s (%s): log channel %s is gone; run /logchannel set again.",
+                    guild,
+                    guild.id,
+                    channel_id,
+                )
+                continue
+            active += 1
+            log.info("Server %s (%s): logging to #%s (%s)", guild, guild.id, channel, channel.id)
+            if guild.me is not None:
+                missing = missing_permissions(
+                    channel.permissions_for(guild.me), LOG_CHANNEL_PERMISSIONS
+                )
+                if missing:
+                    log.warning("Server %s: log channel lacks %s", guild.id, ", ".join(missing))
+            if missing := self.server_permission_problems(guild):
+                log.warning(
+                    "Server %s: scam removal needs these permissions: %s",
+                    guild.id,
+                    ", ".join(missing),
+                )
+        if not active:
+            log.info("No log channel set yet. In your server, run /logchannel set.")
+        log.info(
+            "Scam filter: %s known images, %s blocked domains, action=%s",
+            len(self.known_images),
+            len(self.settings.blocked_domains),
+            self.settings.scam_action,
+        )
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if payload.message_id in self.removed_ids:
@@ -213,14 +289,11 @@ class ModeratorBot(discord.Client):
         message_ids: set[int],
         cached: Mapping[int, discord.Message],
     ) -> None:
-        channel = self.log_channel
-        # Keep each server's messages in its own log. Exclude the log channel to avoid recursion.
-        if (
-            channel is None
-            or guild_id != channel.guild.id
-            or channel_id == channel.id
-            or not message_ids
-        ):
+        # Each server's messages go to its own log. Exclude the log channel to avoid recursion.
+        if not message_ids:
+            return
+        channel = self.log_channel_for(guild_id)
+        if channel is None or channel_id == channel.id:
             return
 
         embed = discord.Embed(
@@ -270,18 +343,17 @@ class ModeratorBot(discord.Client):
     # Scam filter
 
     def should_scan(self, message: discord.Message) -> bool:
-        """Scan members' posts in the logged server. Bots and moderators are trusted."""
-        channel = self.log_channel
+        """Scan members' posts in servers with a log channel. Bots and moderators are trusted."""
         author = message.author
-        return (
-            channel is not None
-            and message.guild is not None
-            and message.guild.id == channel.guild.id
-            and message.channel.id != channel.id
-            and not author.bot
-            and isinstance(author, discord.Member)
-            and not author.guild_permissions.manage_messages
-        )
+        if (
+            message.guild is None
+            or author.bot
+            or not isinstance(author, discord.Member)
+            or author.guild_permissions.manage_messages
+        ):
+            return False
+        channel = self.log_channel_for(message.guild.id)
+        return channel is not None and message.channel.id != channel.id
 
     async def on_message(self, message: discord.Message) -> None:
         if not self.should_scan(message):
@@ -367,11 +439,12 @@ class ModeratorBot(discord.Client):
             return "None (SCAM_ACTION=none)"
         now = datetime.now(UTC)
         self.actioned = {
-            user: when for user, when in self.actioned.items() if now - when < timedelta(minutes=5)
+            key: when for key, when in self.actioned.items() if now - when < timedelta(minutes=5)
         }
-        if member.id in self.actioned:
+        key = (member.guild.id, member.id)
+        if key in self.actioned:
             return "Already actioned for an earlier copy"
-        self.actioned[member.id] = now  # before awaiting, so parallel copies don't repeat it
+        self.actioned[key] = now  # before awaiting, so parallel copies don't repeat it
         audit_reason = shorten(f"Scam filter: {reason}", 500)
         try:
             if action == "timeout":
@@ -384,7 +457,7 @@ class ModeratorBot(discord.Client):
             await member.guild.ban(member, reason=audit_reason, delete_message_seconds=3600)
             return "Banned; their messages from the last hour were deleted"
         except discord.HTTPException as exc:
-            self.actioned.pop(member.id, None)
+            self.actioned.pop(key, None)
             log.warning("Could not %s member %s (HTTP %s)", action, member.id, exc.status)
             return (
                 f"{action.title()} failed (HTTP {exc.status}). Check the bot's permissions "
@@ -399,7 +472,7 @@ class ModeratorBot(discord.Client):
         deleted: int,
         action: str,
     ) -> None:
-        channel = self.log_channel
+        channel = self.log_channel_for(message.guild.id)
         if channel is None:
             return
         author = message.author
@@ -440,6 +513,103 @@ class ModeratorBot(discord.Client):
             log.exception("Could not log scam removal for message %s", message.id)
 
 
+class LogChannelCommands(
+    app_commands.Group,
+    name="logchannel",
+    description="Choose where this server's moderation logs go",
+    guild_only=True,
+    # Hidden from members without Manage Server. Admins can change this in
+    # Server Settings > Integrations.
+    default_permissions=discord.Permissions(manage_guild=True),
+):
+    def __init__(self, bot: ModeratorBot) -> None:
+        super().__init__()
+        self.bot = bot
+
+    @app_commands.command(name="set", description="Post deletion and scam logs in a channel")
+    @app_commands.describe(channel="A private channel that only moderators can read")
+    async def set_channel(
+        self, interaction: discord.Interaction, channel: discord.TextChannel
+    ) -> None:
+        guild = interaction.guild
+        if guild is None or guild.me is None:
+            await reply(interaction, "Invite the bot to this server first.")
+            return
+        missing = missing_permissions(channel.permissions_for(guild.me), LOG_CHANNEL_PERMISSIONS)
+        if missing:
+            await reply(
+                interaction,
+                f"I need these permissions in {channel.mention} first: {', '.join(missing)}.",
+            )
+            return
+        embed = discord.Embed(
+            title="Moderation log channel",
+            description=(
+                "Deleted messages and removed scam posts from this server will be logged here. "
+                "Keep this channel private to moderators."
+            ),
+            colour=discord.Colour.green(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.set_footer(text=f"Set by {shorten(str(interaction.user), 100)}")
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as exc:
+            await reply(interaction, f"I could not post in {channel.mention} (HTTP {exc.status}).")
+            return
+        try:
+            self.bot.store.set(guild.id, channel.id)
+        except OSError:
+            log.exception("Could not save the log channel for server %s", guild.id)
+            await reply(interaction, "I could not save this setting. Check the bot's console.")
+            return
+        log.info("Server %s (%s): log channel set to %s", guild, guild.id, channel.id)
+        text = f"Logs will go to {channel.mention}, and the scam filter is on."
+        if problems := self.bot.server_permission_problems(guild):
+            text += (
+                "\nTo delete scam posts and apply the scam action I also need these server "
+                f"permissions: {', '.join(problems)}."
+            )
+        await reply(interaction, text)
+
+    @app_commands.command(name="show", description="Show the current log channel")
+    async def show(self, interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id
+        channel_id = self.bot.store.channels.get(guild_id) if guild_id else None
+        if channel_id is None:
+            text = "No log channel is set. Use `/logchannel set` to choose one."
+        elif self.bot.log_channel_for(guild_id) is None:
+            text = f"The log channel (`{channel_id}`) is gone or hidden from me. Set a new one."
+        else:
+            text = f"Logs go to <#{channel_id}>."
+        await reply(interaction, text)
+
+    @app_commands.command(name="off", description="Stop logging and scam removal here")
+    async def off(self, interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id
+        if guild_id is None or guild_id not in self.bot.store.channels:
+            await reply(interaction, "No log channel is set, so logging is already off.")
+            return
+        try:
+            self.bot.store.set(guild_id, None)
+        except OSError:
+            log.exception("Could not save the log channel for server %s", guild_id)
+            await reply(interaction, "I could not save this setting. Check the bot's console.")
+            return
+        await reply(
+            interaction,
+            "Logging and the scam filter are off in this server. "
+            "Use `/logchannel set` to turn them back on.",
+        )
+
+
+async def reply(interaction: discord.Interaction, text: str) -> None:
+    """Answer only the person who ran the command."""
+    await interaction.response.send_message(
+        text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
 def message_parts(message: discord.Message) -> tuple[str, list[discord.Attachment]]:
     """Text and attachments of a message, including any forwarded message inside it."""
     texts = [message.content]
@@ -464,7 +634,9 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    load_dotenv()
+    load_dotenv(BASE_DIR / ".env")
+    if os.environ.get("DISCORD_LOG_CHANNEL_ID"):
+        log.warning("DISCORD_LOG_CHANNEL_ID is no longer used. Run /logchannel set in your server.")
     try:
         settings = Settings.from_env(os.environ)
         ModeratorBot(settings).run(settings.token, log_handler=None)

@@ -1,6 +1,6 @@
 # Discord moderator bot
 
-A Python bot for one Discord server that:
+A Python bot for Discord servers that:
 
 - posts deleted-message logs into a moderator channel. It handles single deletions
   and bulk purges, with author IDs, channel IDs, message IDs, timestamps, cached
@@ -16,7 +16,8 @@ A Python bot for one Discord server that:
 2. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
    In **Bot**, obtain a bot token and enable **Message Content Intent** under
    **Privileged Gateway Intents**. Keep the token private.
-3. Use **OAuth2 → URL Generator** with the `bot` scope to invite it to your server.
+3. Use **OAuth2 → URL Generator** with the `bot` and `applications.commands` scopes to
+   invite it to your server.
    Give it **View Channels**, **Read Message History**, **Manage Messages**, and
    **Timeout Members** (use **Kick Members** or **Ban Members** instead if you change
    `SCAM_ACTION`). In a private moderator log channel, also grant **Send Messages**,
@@ -24,28 +25,68 @@ A Python bot for one Discord server that:
    In **Server Settings → Roles**, drag the bot's role above the roles of the members
    it should time out. Discord does not let a bot act on members with equal or
    higher roles.
-4. Enable **Developer Mode** under Discord's **User Settings → Advanced**.
-   Right-click your moderator log channel and choose **Copy Channel ID**.
-5. From this directory, run:
+4. From this directory, run:
 
    ```sh
    cp .env.example .env
    ```
 
-   Edit `.env` and fill in `DISCORD_TOKEN` and `DISCORD_LOG_CHANNEL_ID`, then run:
+   Edit `.env` and fill in `DISCORD_TOKEN`, then run:
 
    ```sh
    uv sync --locked --system-certs
    uv run --system-certs bot.py
    ```
 
+   To run it on a hosting panel instead, see [Hosting](#hosting).
+5. In your server, run `/logchannel set` and pick a private moderator channel.
+   See [Choosing the log channel](#choosing-the-log-channel).
 6. Send a message in another channel the bot can view, then delete it. Check the
    moderator log channel for an embed and transcript. Try a bulk purge too.
 
-The bot only logs the server containing the configured log channel. Direct messages
-and deletions inside the log channel are ignored. Keep the process running on your
-computer or a host to receive deletion events. Startup validates channel access;
-permission or delivery failures are reported to the process console.
+Direct messages and deletions inside the log channel are ignored. Keep the process
+running on your computer or a host to receive deletion events. Permission or
+delivery failures are reported to the process console.
+
+## Choosing the log channel
+
+Each server picks its own log channel in Discord. There is no channel setting in
+`.env`. Only members with **Manage Server** see these commands. Admins can change who
+may use them in **Server Settings → Integrations**.
+
+| Command | What it does |
+| --- | --- |
+| `/logchannel set channel:` | Log this server's deleted messages and scam removals in that channel |
+| `/logchannel show` | Show the current log channel |
+| `/logchannel off` | Stop logging and the scam filter in this server |
+
+Before saving, `/logchannel set` checks that the bot can view the channel and send
+messages, embeds, and files there, then posts a confirmation in it. It also warns if
+the bot lacks the server permissions the scam filter needs. The bot logs and
+filters only servers that have a log channel. Choices are saved in
+`data/log_channels.json` (change the folder with `DATA_DIR`), so they survive
+restarts. Keep that folder when you move or redeploy the bot.
+
+New slash commands can take a few minutes to appear in Discord the first time the
+bot starts.
+
+## Hosting
+
+The bot runs on Pterodactyl-style hosting panels, such as Bot-Hosting.net, that
+offer a Python server:
+
+1. Choose Python 3.11 or newer.
+2. Upload the project files. Leave out `.venv/`, `.env`, and `__pycache__/`.
+   The panel installs the packages listed in `requirements.txt` at startup.
+3. Set the startup file to `bot.py`. `main.py` also works, for panels that default to it.
+4. Add `DISCORD_TOKEN` as an environment variable, marked secret if the panel allows,
+   or upload a `.env` file next to `bot.py`. Other settings from `.env.example` are
+   optional.
+5. Start the server. The console should show `Logged in as ...`. Then run
+   `/logchannel set` in Discord.
+
+The bot stops at startup only if `DISCORD_TOKEN` is missing or wrong, or if
+**Message Content Intent** is off in the Developer Portal. The console says which.
 
 ## Scam filter
 

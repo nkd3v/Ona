@@ -9,6 +9,9 @@ A Python bot for Discord servers that:
 - automatically deletes scam posts, such as the "MrBeast crypto casino" (wispwin.com)
   images posted by hacked accounts, and times out the poster. See
   [Scam filter](#scam-filter).
+- runs a trap channel: anyone who posts in a channel marked "do not send messages
+  here" is timed out and their recent messages are deleted. Spam bots post
+  everywhere, so they fall for it. See [Trap channel](#trap-channel).
 
 ## Setup
 
@@ -18,8 +21,8 @@ A Python bot for Discord servers that:
    **Privileged Gateway Intents**. Keep the token private.
 3. Use **OAuth2 → URL Generator** with the `bot` and `applications.commands` scopes to
    invite it to your server.
-   Give it **View Channels**, **Read Message History**, **Manage Messages**, and
-   **Timeout Members** (use **Kick Members** or **Ban Members** instead if you change
+   Give it **View Channels**, **Send Messages**, **Embed Links**, **Read Message History**,
+   **Manage Messages**, and **Timeout Members** (use **Kick Members** or **Ban Members** instead if you change
    `SCAM_ACTION`). In a private moderator log channel, also grant **Send Messages**,
    **Embed Links**, and **Attach Files**. Administrator is unnecessary.
    In **Server Settings → Roles**, drag the bot's role above the roles of the members
@@ -41,7 +44,8 @@ A Python bot for Discord servers that:
    To run it on a hosting panel instead, see [Hosting](#hosting).
 5. In your server, run `/logchannel set` and pick a private moderator channel.
    See [Choosing the log channel](#choosing-the-log-channel).
-6. Send a message in another channel the bot can view, then delete it. Check the
+6. Optionally, run `/trapchannel set` to catch spam bots. See [Trap channel](#trap-channel).
+7. Send a message in another channel the bot can view, then delete it. Check the
    moderator log channel for an embed and transcript. Try a bulk purge too.
 
 Direct messages and deletions inside the log channel are ignored. Keep the process
@@ -118,6 +122,47 @@ Images up to 10 MB are downloaded for checking. Text inside images is not read,
 so a new scam with different images is only caught by the cross-channel rule
 until you add its images or domain. Startup logs a warning if the bot lacks the
 permissions for deleting or timing out.
+
+## Trap channel
+
+Spam bots and hacked accounts post in every channel they can. A trap channel is a
+channel that every member can see and post in, with a notice telling people not to.
+Anyone who posts there anyway is caught:
+
+1. Their message is deleted, along with all their messages from the last hour (or the
+   period you choose) in every channel the bot can see.
+2. They are timed out for 1 day (or the period you choose).
+3. The moderator log channel gets a red "Trap channel triggered" embed with what was
+   deleted, the result, and a transcript.
+
+When you set it up, the bot posts a "DO NOT SEND MESSAGES IN THIS CHANNEL" notice in
+the channel with a greyed-out **Timeouts:** button that counts everyone caught.
+
+| Command | What it does |
+| --- | --- |
+| `/trapchannel set channel: timeout: delete_messages:` | Make that channel a trap and post the notice. `timeout` is 1 hour, 1 day (default), 1 week or 28 days. `delete_messages` is how far back to delete: 10 minutes, 1 hour (default), 6 hours or 1 day |
+| `/trapchannel show` | Show the trap channel, its settings and the count |
+| `/trapchannel off` | Stop the trap and remove its notice |
+
+Like `/logchannel`, only members with **Manage Server** see these commands. Running
+`/trapchannel set` again changes the settings or moves the trap, replacing the old
+notice and keeping the count. The trap works without a log channel, but you only get
+reports of each catch if one is set.
+
+Set up the channel so that:
+
+- members can see it and send messages in it (otherwise nobody can be caught),
+- the bot has **View Channel**, **Send Messages**, **Embed Links**, **Read Message
+  History** and **Manage Messages** there (`/trapchannel set` checks this), and
+- the bot's role is above the roles of the members it should time out.
+
+Moderators (members with **Manage Messages**) and bots are never caught, so staff can
+post in the channel. A spam burst gets one timeout and one count per person. Settings
+are saved in `data/trap_channels.json`.
+
+Discord has no way to delete one person's messages short of banning them, so the bot
+deletes the messages it has in its memory (see below). Messages sent before the bot
+last started, or older than its cache, are not deleted.
 
 ## What can be recovered?
 

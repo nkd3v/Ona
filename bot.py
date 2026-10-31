@@ -1,4 +1,4 @@
-"""Log message deletions and remove scam posts in Discord servers."""
+"""Log message deletions, remove scam posts and run a spam-bot trap channel in Discord servers."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import logging
 import os
 from collections.abc import Mapping
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -35,6 +35,20 @@ MODERATION_PERMISSIONS = {
 }
 MAX_TIMEOUT_MINUTES = 28 * 24 * 60  # Discord's limit
 LOG_CHANNEL_PERMISSIONS = ("view_channel", "send_messages", "embed_links", "attach_files")
+# The trap channel needs these to post its notice and delete what members post there.
+TRAP_CHANNEL_PERMISSIONS = (
+    "view_channel",
+    "send_messages",
+    "embed_links",
+    "read_message_history",
+    "manage_messages",
+)
+# Server-wide: deleting a caught member's messages in other channels, and timing them out.
+TRAP_SERVER_PERMISSIONS = ("manage_messages", "moderate_members")
+TRAP_TIMEOUT_CHOICES = {"1 hour": 60, "1 day": 1440, "1 week": 10080, "28 days": 40320}
+TRAP_DELETE_CHOICES = {"10 minutes": 10, "1 hour": 60, "6 hours": 360, "1 day": 1440}
+# Remember who was just punished, so a burst of messages gets one timeout and one count.
+ACTION_MEMORY = timedelta(minutes=5)
 
 
 def resolve(path: str | Path) -> Path:
@@ -131,11 +145,62 @@ class LogChannelStore:
             channels.pop(guild_id, None)
         else:
             channels[guild_id] = channel_id
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_suffix(".tmp")
-        temp.write_text(json.dumps({str(k): v for k, v in channels.items()}, indent=2), "utf-8")
-        os.replace(temp, self.path)  # atomic, so a crash never leaves a half-written file
+        save_json(self.path, {str(k): v for k, v in channels.items()})
         self.channels = channels
+
+
+def save_json(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, indent=2), "utf-8")
+    os.replace(temp, path)  # atomic, so a crash never leaves a half-written file
+
+
+@dataclass(frozen=True)
+class Trap:
+    """A server's trap channel: anyone who posts there is treated as a spam bot."""
+
+    channel_id: int
+    timeout_minutes: int = 1440
+    delete_minutes: int = 60
+    notice_id: int | None = None  # the bot's warning post, which shows the counter
+    count: int = 0  # members timed out by the trap so far
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, object]) -> Trap:
+        notice = raw.get("notice_id")
+        return cls(
+            channel_id=int(raw["channel_id"]),
+            timeout_minutes=int(raw.get("timeout_minutes", 1440)),
+            delete_minutes=int(raw.get("delete_minutes", 60)),
+            notice_id=None if notice is None else int(notice),
+            count=int(raw.get("count", 0)),
+        )
+
+
+class TrapStore:
+    """Each server's trap channel, chosen with /trapchannel set and saved to a JSON file."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.traps: dict[int, Trap] = {}
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            self.traps = {int(k): Trap.from_dict(v) for k, v in raw.items()}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+            raise ValueError(f"Cannot read saved trap channels from {path}: {exc}") from exc
+
+    def set(self, guild_id: int, trap: Trap | None) -> None:
+        """Save a server's trap, or forget it when trap is None."""
+        traps = dict(self.traps)
+        if trap is None:
+            traps.pop(guild_id, None)
+        else:
+            traps[guild_id] = trap
+        save_json(self.path, {str(k): asdict(v) for k, v in traps.items()})
+        self.traps = traps
 
 
 def shorten(text: str, limit: int) -> str:
@@ -197,6 +262,7 @@ class ModeratorBot(discord.Client):
         )
         self.settings = settings
         self.store = LogChannelStore(settings.data_dir / "log_channels.json")
+        self.traps = TrapStore(settings.data_dir / "trap_channels.json")
         self.known_images = dict(scam_filter.KNOWN_SCAM_IMAGES)
         self.known_images.update(scam_filter.load_image_dir(settings.scam_images_dir))
         self.blocked_domains = scam_filter.domain_pattern(settings.blocked_domains)
@@ -205,15 +271,18 @@ class ModeratorBot(discord.Client):
         self.removed_ids: set[int] = set()
         # (server ID, member ID) -> when the scam action was applied.
         self.actioned: dict[tuple[int, int], datetime] = {}
+        # (server ID, member ID) -> when the trap channel timed them out.
+        self.trapped: dict[tuple[int, int], datetime] = {}
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(LogChannelCommands(self))
+        self.tree.add_command(TrapChannelCommands(self))
 
     async def setup_hook(self) -> None:
         try:
             await self.tree.sync()
         except discord.HTTPException:
             # Logging keeps working with commands registered by an earlier start.
-            log.exception("Could not register the /logchannel command with Discord")
+            log.exception("Could not register slash commands with Discord")
 
     def log_channel_for(self, guild_id: int | None) -> discord.TextChannel | None:
         """The server's log channel, if one was set and the bot can still see it."""
@@ -230,6 +299,14 @@ class ModeratorBot(discord.Client):
             return []
         needed = ("manage_messages", *MODERATION_PERMISSIONS[self.settings.scam_action])
         return missing_permissions(guild.me.guild_permissions, needed)
+
+    def trap_channel_for(self, guild_id: int) -> discord.TextChannel | None:
+        """The server's trap channel, if one was set and the bot can still see it."""
+        trap = self.traps.traps.get(guild_id)
+        channel = self.get_channel(trap.channel_id) if trap else None
+        if isinstance(channel, discord.TextChannel) and channel.guild.id == guild_id:
+            return channel
+        return None
 
     async def on_ready(self) -> None:
         # Problems here are logged, not fatal: admins fix them with /logchannel set.
@@ -264,6 +341,31 @@ class ModeratorBot(discord.Client):
                 )
         if not active:
             log.info("No log channel set yet. In your server, run /logchannel set.")
+        for guild in self.guilds:
+            if (trap := self.traps.traps.get(guild.id)) is None:
+                continue
+            channel = self.trap_channel_for(guild.id)
+            if channel is None:
+                log.warning(
+                    "Server %s (%s): trap channel %s is gone; run /trapchannel set again.",
+                    guild,
+                    guild.id,
+                    trap.channel_id,
+                )
+                continue
+            log.info(
+                "Server %s (%s): trap channel is #%s (%s)", guild, guild.id, channel, channel.id
+            )
+            if guild.me is not None:
+                missing = missing_permissions(
+                    channel.permissions_for(guild.me), TRAP_CHANNEL_PERMISSIONS
+                ) + missing_permissions(guild.me.guild_permissions, TRAP_SERVER_PERMISSIONS)
+                if missing:
+                    log.warning(
+                        "Server %s: trap channel needs these permissions: %s",
+                        guild.id,
+                        ", ".join(dict.fromkeys(missing)),
+                    )
         log.info(
             "Scam filter: %s known images, %s blocked domains, action=%s",
             len(self.known_images),
@@ -279,8 +381,11 @@ class ModeratorBot(discord.Client):
         await self.log_deletion(payload.guild_id, payload.channel_id, {payload.message_id}, cached)
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        # Leave out messages this bot removed itself; they have their own log.
+        message_ids = payload.message_ids - self.removed_ids
+        self.removed_ids -= payload.message_ids
         cached = {message.id: message for message in payload.cached_messages}
-        await self.log_deletion(payload.guild_id, payload.channel_id, payload.message_ids, cached)
+        await self.log_deletion(payload.guild_id, payload.channel_id, message_ids, cached)
 
     async def log_deletion(
         self,
@@ -342,20 +447,35 @@ class ModeratorBot(discord.Client):
 
     # Scam filter
 
-    def should_scan(self, message: discord.Message) -> bool:
-        """Scan members' posts in servers with a log channel. Bots and moderators are trusted."""
+    @staticmethod
+    def is_member_post(message: discord.Message) -> bool:
+        """A server post by an ordinary member. Bots and moderators are trusted."""
         author = message.author
-        if (
-            message.guild is None
-            or author.bot
-            or not isinstance(author, discord.Member)
-            or author.guild_permissions.manage_messages
-        ):
+        return (
+            message.guild is not None
+            and not author.bot
+            and isinstance(author, discord.Member)
+            and not author.guild_permissions.manage_messages
+        )
+
+    def should_scan(self, message: discord.Message) -> bool:
+        """Scan members' posts in servers with a log channel."""
+        if not self.is_member_post(message):
             return False
         channel = self.log_channel_for(message.guild.id)
         return channel is not None and message.channel.id != channel.id
 
+    def trap_for(self, message: discord.Message) -> Trap | None:
+        """The server's trap, if this member post is in its trap channel."""
+        if not self.is_member_post(message):
+            return None
+        trap = self.traps.traps.get(message.guild.id)
+        return trap if trap is not None and message.channel.id == trap.channel_id else None
+
     async def on_message(self, message: discord.Message) -> None:
+        if (trap := self.trap_for(message)) is not None:
+            await self.spring_trap(message, trap)
+            return
         if not self.should_scan(message):
             return
         found = await self.find_scam(message)
@@ -410,41 +530,69 @@ class ModeratorBot(discord.Client):
 
         return list(await asyncio.gather(*(one(item) for item in attachments)))
 
+    async def delete_messages(self, messages: list[discord.Message], reason: str) -> int:
+        """Delete messages without logging them as ordinary deletions; return how many went.
+
+        Several messages in one channel go in one bulk request.
+        """
+        if len(self.removed_ids) > 1_000:  # delete events missed while disconnected
+            self.removed_ids.clear()
+        by_channel: dict[int, list[discord.Message]] = {}
+        for message in messages:
+            # Skip messages another handler is already deleting.
+            if message.id not in self.removed_ids:
+                by_channel.setdefault(message.channel.id, []).append(message)
+        deleted = 0
+        for channel_messages in by_channel.values():
+            for start in range(0, len(channel_messages), 100):  # Discord's bulk limit
+                batch = channel_messages[start : start + 100]
+                ids = {message.id for message in batch}
+                self.removed_ids |= ids
+                try:
+                    if len(batch) == 1:
+                        await batch[0].delete()
+                    else:
+                        await batch[0].channel.delete_messages(batch, reason=shorten(reason, 500))
+                    deleted += len(batch)
+                except discord.HTTPException as exc:
+                    self.removed_ids -= ids
+                    if not isinstance(exc, discord.NotFound):
+                        log.warning(
+                            "Could not delete %s message(s) in channel %s (HTTP %s)",
+                            len(batch),
+                            batch[0].channel.id,
+                            exc.status,
+                        )
+        return deleted
+
     async def remove_scam(
         self, message: discord.Message, reason: str, copies: list[discord.Message]
     ) -> None:
-        if len(self.removed_ids) > 1_000:  # delete events missed while disconnected
-            self.removed_ids.clear()
-        deleted = 0
-        for copy in copies:
-            self.removed_ids.add(copy.id)
-            try:
-                await copy.delete()
-                deleted += 1
-            except discord.HTTPException as exc:
-                self.removed_ids.discard(copy.id)
-                if not isinstance(exc, discord.NotFound):
-                    log.warning(
-                        "Could not delete scam message %s in channel %s (HTTP %s)",
-                        copy.id,
-                        copy.channel.id,
-                        exc.status,
-                    )
+        deleted = await self.delete_messages(copies, f"Scam filter: {reason}")
         action = await self.punish(message.author, reason)
         await self.log_removal(message, copies, reason, deleted, action)
+
+    @staticmethod
+    def claim(recent: dict[tuple[int, int], datetime], key: tuple[int, int]) -> bool:
+        """Record an action on a member; False if they were already actioned just now.
+
+        Call it before awaiting, so messages handled in parallel don't repeat the action.
+        """
+        now = datetime.now(UTC)
+        for old in [k for k, when in recent.items() if now - when >= ACTION_MEMORY]:
+            del recent[old]
+        if key in recent:
+            return False
+        recent[key] = now
+        return True
 
     async def punish(self, member: discord.Member, reason: str) -> str:
         action = self.settings.scam_action
         if action == "none":
             return "None (SCAM_ACTION=none)"
-        now = datetime.now(UTC)
-        self.actioned = {
-            key: when for key, when in self.actioned.items() if now - when < timedelta(minutes=5)
-        }
         key = (member.guild.id, member.id)
-        if key in self.actioned:
+        if not self.claim(self.actioned, key):
             return "Already actioned for an earlier copy"
-        self.actioned[key] = now  # before awaiting, so parallel copies don't repeat it
         audit_reason = shorten(f"Scam filter: {reason}", 500)
         try:
             if action == "timeout":
@@ -464,6 +612,79 @@ class ModeratorBot(discord.Client):
                 "and that its role is above the member's highest role."
             )
 
+    async def spring_trap(self, message: discord.Message, trap: Trap) -> None:
+        """Delete the member's recent messages, time them out and count the catch."""
+        member = message.author
+        guild_id = message.guild.id
+        since = message.created_at - timedelta(minutes=trap.delete_minutes)
+        # Discord has no "delete this member's messages" call short of a ban, so use
+        # the bot's message cache, which holds recent messages from every channel.
+        recent = {
+            cached.id: cached
+            for cached in self.cached_messages
+            if cached.guild is not None
+            and cached.guild.id == guild_id
+            and cached.author.id == member.id
+            and cached.created_at >= since
+        }
+        recent[message.id] = message
+        messages = sorted(recent.values(), key=lambda item: item.id)
+        reason = f"Trap channel: posted in #{message.channel}"
+        deleted = await self.delete_messages(messages, reason)
+
+        caught = False
+        if not self.claim(self.trapped, (guild_id, member.id)):
+            action = "Already timed out for an earlier message"
+        else:
+            minutes = trap.timeout_minutes
+            try:
+                await member.timeout(timedelta(minutes=minutes), reason=shorten(reason, 500))
+                action = f"Timed out for {format_minutes(minutes)}"
+                caught = True
+            except discord.HTTPException as exc:
+                self.trapped.pop((guild_id, member.id), None)
+                log.warning("Could not time out member %s (HTTP %s)", member.id, exc.status)
+                action = (
+                    f"Timeout failed (HTTP {exc.status}). Check the bot's permissions "
+                    "and that its role is above the member's highest role."
+                )
+
+        await self.log_removal(
+            message,
+            messages,
+            f"Posted in the trap channel <#{message.channel.id}>",
+            deleted,
+            action,
+            title="Trap channel triggered",
+            actor="this bot's trap channel",
+            file_prefix="trap",
+        )
+        if caught:
+            await self.count_catch(guild_id)
+
+    async def count_catch(self, guild_id: int) -> None:
+        """Add one to the trap's counter and show it on the notice."""
+        trap = self.traps.traps.get(guild_id)
+        if trap is None:
+            return
+        trap = replace(trap, count=trap.count + 1)
+        try:
+            self.traps.set(guild_id, trap)
+        except OSError:
+            log.exception("Could not save the trap counter for server %s", guild_id)
+        channel = self.trap_channel_for(guild_id)
+        if channel is None or trap.notice_id is None:
+            return
+        view = counter_view(trap.count)
+        try:
+            await channel.get_partial_message(trap.notice_id).edit(view=view)
+        except discord.HTTPException as exc:
+            log.warning(
+                "Could not update the trap notice in server %s (HTTP %s)", guild_id, exc.status
+            )
+        finally:
+            view.stop()
+
     async def log_removal(
         self,
         message: discord.Message,
@@ -471,6 +692,10 @@ class ModeratorBot(discord.Client):
         reason: str,
         deleted: int,
         action: str,
+        *,
+        title: str = "Scam post removed",
+        actor: str = "this bot's scam filter",
+        file_prefix: str = "scam",
     ) -> None:
         channel = self.log_channel_for(message.guild.id)
         if channel is None:
@@ -478,7 +703,7 @@ class ModeratorBot(discord.Client):
         author = message.author
         channel_ids = sorted({copy.channel.id for copy in copies})
         embed = discord.Embed(
-            title="Scam post removed",
+            title=title,
             description=shorten(reason, 1000),
             colour=discord.Colour.red(),
             timestamp=datetime.now(UTC),
@@ -502,15 +727,16 @@ class ModeratorBot(discord.Client):
             ", ".join(map(str, channel_ids)),
             ids,
             {copy.id: copy for copy in copies},
-            actor=f"this bot's scam filter ({reason})",
+            actor=f"{actor} ({reason})",
         ).encode("utf-8")
         try:
-            with closing(discord.File(io.BytesIO(data), filename=f"scam-{min(ids)}.txt")) as file:
+            filename = f"{file_prefix}-{min(ids)}.txt"
+            with closing(discord.File(io.BytesIO(data), filename=filename)) as file:
                 await channel.send(
                     embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none()
                 )
         except discord.HTTPException:
-            log.exception("Could not log scam removal for message %s", message.id)
+            log.exception("Could not log removal of message %s", message.id)
 
 
 class LogChannelCommands(
@@ -601,6 +827,170 @@ class LogChannelCommands(
             "Logging and the scam filter are off in this server. "
             "Use `/logchannel set` to turn them back on.",
         )
+
+
+class TrapChannelCommands(
+    app_commands.Group,
+    name="trapchannel",
+    description="Catch spam bots with a channel nobody should post in",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+):
+    def __init__(self, bot: ModeratorBot) -> None:
+        super().__init__()
+        self.bot = bot
+
+    @app_commands.command(
+        name="set", description="Time out anyone who posts in a channel and delete their messages"
+    )
+    @app_commands.rename(timeout_for="timeout")
+    @app_commands.describe(
+        channel="A channel members can see and post in, but are told not to",
+        timeout_for="How long to time out anyone who posts there (default: 1 day)",
+        delete_messages="How far back to delete their messages in every channel (default: 1 hour)",
+    )
+    @app_commands.choices(
+        timeout_for=[app_commands.Choice(name=k, value=v) for k, v in TRAP_TIMEOUT_CHOICES.items()],
+        delete_messages=[
+            app_commands.Choice(name=k, value=v) for k, v in TRAP_DELETE_CHOICES.items()
+        ],
+    )
+    async def set_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        timeout_for: app_commands.Choice[int] | None = None,
+        delete_messages: app_commands.Choice[int] | None = None,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None or guild.me is None:
+            await reply(interaction, "Invite the bot to this server first.")
+            return
+        if channel.id == self.bot.store.channels.get(guild.id):
+            await reply(interaction, "The log channel cannot also be the trap channel.")
+            return
+        missing = missing_permissions(channel.permissions_for(guild.me), TRAP_CHANNEL_PERMISSIONS)
+        if missing:
+            await reply(
+                interaction,
+                f"I need these permissions in {channel.mention} first: {', '.join(missing)}.",
+            )
+            return
+        old = self.bot.traps.traps.get(guild.id)
+        trap = Trap(
+            channel.id,
+            timeout_minutes=timeout_for.value if timeout_for else 1440,
+            delete_minutes=delete_messages.value if delete_messages else 60,
+            count=old.count if old else 0,
+        )
+        view = counter_view(trap.count)
+        try:
+            notice = await channel.send(
+                embed=trap_notice(trap), view=view, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.HTTPException as exc:
+            await reply(interaction, f"I could not post in {channel.mention} (HTTP {exc.status}).")
+            return
+        finally:
+            view.stop()
+        trap = replace(trap, notice_id=notice.id)
+        try:
+            self.bot.traps.set(guild.id, trap)
+        except OSError:
+            log.exception("Could not save the trap channel for server %s", guild.id)
+            await self.bot.delete_messages([notice], "Trap channel setup failed")
+            await reply(interaction, "I could not save this setting. Check the bot's console.")
+            return
+        log.info("Server %s (%s): trap channel set to %s", guild, guild.id, channel.id)
+        await reply(interaction, self.describe(guild, trap))
+        if old is not None and old.notice_id is not None:
+            await delete_notice(self.bot, old)
+
+    def describe(self, guild: discord.Guild, trap: Trap) -> str:
+        text = (
+            f"Trap channel: <#{trap.channel_id}>. Anyone without Manage Messages who posts there "
+            f"is timed out for {format_minutes(trap.timeout_minutes)}, and their messages from "
+            f"the last {format_minutes(trap.delete_minutes)} are deleted in every channel. "
+            f"Caught so far: {trap.count:,}."
+        )
+        if guild.me is not None and (
+            problems := missing_permissions(guild.me.guild_permissions, TRAP_SERVER_PERMISSIONS)
+        ):
+            text += f"\nI also need these server permissions: {', '.join(problems)}."
+        if self.bot.log_channel_for(guild.id) is None:
+            text += "\nSet a log channel with `/logchannel set` to get a report of each catch."
+        return text
+
+    @app_commands.command(name="show", description="Show the current trap channel")
+    async def show(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        trap = self.bot.traps.traps.get(guild.id) if guild else None
+        if trap is None:
+            text = "No trap channel is set. Use `/trapchannel set` to choose one."
+        elif self.bot.trap_channel_for(guild.id) is None:
+            text = (
+                f"The trap channel (`{trap.channel_id}`) is gone or hidden from me. Set a new one."
+            )
+        else:
+            text = self.describe(guild, trap)
+        await reply(interaction, text)
+
+    @app_commands.command(name="off", description="Stop the trap channel")
+    async def off(self, interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id
+        trap = self.bot.traps.traps.get(guild_id) if guild_id else None
+        if trap is None:
+            await reply(interaction, "No trap channel is set, so the trap is already off.")
+            return
+        try:
+            self.bot.traps.set(guild_id, None)
+        except OSError:
+            log.exception("Could not save the trap channel for server %s", guild_id)
+            await reply(interaction, "I could not save this setting. Check the bot's console.")
+            return
+        await reply(
+            interaction,
+            f"The trap in <#{trap.channel_id}> is off and its notice is removed. "
+            "Use `/trapchannel set` to turn it back on.",
+        )
+        await delete_notice(self.bot, trap)
+
+
+def trap_notice(trap: Trap) -> discord.Embed:
+    """The warning posted in the trap channel."""
+    return discord.Embed(
+        title="DO NOT SEND MESSAGES IN THIS CHANNEL",
+        description=(
+            "This channel is used to catch spam bots. Anyone who sends a message here is "
+            f"**timed out for {format_minutes(trap.timeout_minutes)}**, and their messages "
+            f"from the last {format_minutes(trap.delete_minutes)} are deleted."
+        ),
+        colour=discord.Colour.red(),
+    )
+
+
+def counter_view(count: int) -> discord.ui.View:
+    """A greyed-out button under the notice that shows how many members were caught.
+
+    Call stop() on it after sending, so the bot does not keep it in memory.
+    """
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label=f"Timeouts: {count:,}", style=discord.ButtonStyle.secondary, disabled=True
+        )
+    )
+    return view
+
+
+async def delete_notice(bot: ModeratorBot, trap: Trap) -> None:
+    """Remove an old trap notice, if it is still there."""
+    channel = bot.get_channel(trap.channel_id)
+    if trap.notice_id is None or not isinstance(channel, discord.TextChannel):
+        return
+    await bot.delete_messages(
+        [channel.get_partial_message(trap.notice_id)], "Trap channel moved or turned off"
+    )
 
 
 async def reply(interaction: discord.Interaction, text: str) -> None:

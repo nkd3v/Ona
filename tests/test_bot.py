@@ -9,7 +9,16 @@ import discord
 
 import bot as bot_module
 import scam_filter
-from bot import LogChannelStore, ModeratorBot, Settings, format_minutes, shorten, transcript
+from bot import (
+    LogChannelStore,
+    ModeratorBot,
+    Settings,
+    Trap,
+    TrapStore,
+    format_minutes,
+    shorten,
+    transcript,
+)
 from tests.test_scam_filter import encode, sample_image
 
 
@@ -493,6 +502,250 @@ class ScamFilterBotTests(unittest.IsolatedAsyncioTestCase):
                 author.timeout.assert_not_awaited()
                 self.assertEqual(author.kick.await_count, action == "kick")
                 self.assertEqual(author.guild.ban.await_count, action == "ban")
+
+
+class TrapStoreTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "data" / "trap_channels.json"
+
+    def test_saves_and_reloads_per_server_traps(self):
+        store = TrapStore(self.path)
+        self.assertEqual(store.traps, {})
+        store.set(1, Trap(50, timeout_minutes=60, delete_minutes=10, notice_id=7, count=3))
+        store.set(2, Trap(60))
+        self.assertEqual(
+            TrapStore(self.path).traps,
+            {1: Trap(50, 60, 10, 7, 3), 2: Trap(60, 1440, 60, None, 0)},
+        )
+        store.set(2, None)
+        self.assertEqual(set(TrapStore(self.path).traps), {1})
+
+    def test_unreadable_file_is_reported(self):
+        self.path.parent.mkdir(parents=True)
+        for content in ("not json", '{"1": {"timeout_minutes": 5}}'):
+            self.path.write_text(content)
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                TrapStore(self.path)
+
+
+TRAP_CHANNEL = 50
+
+
+def trap_post(author, message_id, channel, minutes_ago=0, guild_id=1):
+    message = post(author, message_id, guild_id=guild_id)
+    message.channel = channel
+    message.created_at = datetime(2026, 1, 1, 12, tzinfo=UTC) - timedelta(minutes=minutes_ago)
+    return message
+
+
+def message_channel(channel_id):
+    return SimpleNamespace(id=channel_id, delete_messages=AsyncMock())
+
+
+class TrapChannelBotTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.sent = []
+
+        async def send(**kwargs):
+            self.sent.append(
+                {"embed": kwargs["embed"], "text": kwargs["file"].fp.read().decode("utf-8")}
+            )
+
+        self.bot, self.log_channel = make_bot(self, send, scam_images_dir=Path("/nonexistent"))
+        self.trap_channel = text_channel(AsyncMock(), channel_id=TRAP_CHANNEL)
+        self.notice = SimpleNamespace(edit=AsyncMock())
+        self.trap_channel.get_partial_message.return_value = self.notice
+        channels = {999: self.log_channel, TRAP_CHANNEL: self.trap_channel}
+        self.bot.get_channel = MagicMock(side_effect=channels.get)
+        self.bot.traps.set(1, Trap(TRAP_CHANNEL, notice_id=77))
+        self.cache = []
+        patcher = patch.object(
+            ModeratorBot, "cached_messages", new_callable=PropertyMock, return_value=self.cache
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Messages seen in the trap channel and two other channels.
+        self.trap = message_channel(TRAP_CHANNEL)
+        self.general = message_channel(2)
+        self.memes = message_channel(3)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    async def test_post_in_trap_deletes_recent_messages_times_out_and_counts(self):
+        spammer, bystander = member(42), member(43)
+        recent = [
+            trap_post(spammer, 1, self.general, minutes_ago=5),
+            trap_post(spammer, 2, self.general, minutes_ago=50),
+            trap_post(spammer, 3, self.memes, minutes_ago=1),
+        ]
+        old = trap_post(spammer, 4, self.general, minutes_ago=61)
+        other_server = trap_post(spammer, 5, self.general, minutes_ago=1, guild_id=3)
+        someone_else = trap_post(bystander, 6, self.general, minutes_ago=1)
+        bait = trap_post(spammer, 9, self.trap)
+        self.cache.extend([*recent, old, other_server, someone_else, bait])
+
+        await self.bot.on_message(bait)
+
+        self.general.delete_messages.assert_awaited_once()
+        bulk = self.general.delete_messages.await_args.args[0]
+        self.assertEqual([m.id for m in bulk], [1, 2])
+        recent[2].delete.assert_awaited_once()
+        bait.delete.assert_awaited_once()
+        for kept in (old, other_server, someone_else):
+            kept.delete.assert_not_awaited()
+        spammer.timeout.assert_awaited_once()
+        self.assertEqual(spammer.timeout.await_args.args[0], timedelta(days=1))
+
+        self.assertEqual(len(self.sent), 1)
+        embed = self.sent[0]["embed"]
+        self.assertEqual(embed.title, "Trap channel triggered")
+        self.assertIn(f"<#{TRAP_CHANNEL}>", embed.description)
+        self.assertIn("4/4", str(embed.fields))
+        self.assertIn("Timed out for 1 day", str(embed.fields))
+        self.assertIn("trap channel", self.sent[0]["text"])
+
+        self.assertEqual(TrapStore(self.bot.traps.path).traps[1].count, 1)
+        self.trap_channel.get_partial_message.assert_called_once_with(77)
+        view = self.notice.edit.await_args.kwargs["view"]
+        self.assertEqual(view.children[0].label, "Timeouts: 1")
+        self.assertTrue(view.children[0].disabled)
+
+        # Discord's delete events for these are not logged as ordinary deletions.
+        await self.bot.on_raw_bulk_message_delete(
+            SimpleNamespace(guild_id=1, channel_id=2, message_ids={1, 2}, cached_messages=bulk)
+        )
+        await self.bot.on_raw_message_delete(
+            SimpleNamespace(guild_id=1, channel_id=TRAP_CHANNEL, message_id=9, cached_message=bait)
+        )
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_second_message_is_deleted_without_second_timeout_or_count(self):
+        spammer = member()
+        for message_id in (9, 10):
+            await self.bot.on_message(trap_post(spammer, message_id, self.trap))
+        spammer.timeout.assert_awaited_once()
+        self.assertEqual(self.bot.traps.traps[1].count, 1)
+        self.assertIn("Already timed out", str(self.sent[1]["embed"].fields))
+
+    async def test_works_without_a_log_channel_and_skips_scam_filter(self):
+        self.bot.store.channels = {}
+        spammer = member()
+        bait = trap_post(spammer, 9, self.trap)
+        await self.bot.on_message(bait)
+        bait.delete.assert_awaited_once()
+        spammer.timeout.assert_awaited_once()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.bot.traps.traps[1].count, 1)
+
+    async def test_moderators_bots_and_other_channels_are_ignored(self):
+        messages = [
+            trap_post(member(moderator=True), 9, self.trap),
+            trap_post(member(bot=True), 10, self.trap),
+            trap_post(member(), 11, self.general),
+        ]
+        for message in messages:
+            await self.bot.on_message(message)
+            message.delete.assert_not_awaited()
+            message.author.timeout.assert_not_awaited()
+        self.assertEqual(self.bot.traps.traps[1].count, 0)
+
+    async def test_failed_timeout_is_reported_and_not_counted(self):
+        spammer = member()
+        response = SimpleNamespace(status=403, reason="Forbidden")
+        spammer.timeout = AsyncMock(side_effect=discord.Forbidden(response, "hierarchy"))
+        with self.assertLogs("bot", level="WARNING"):
+            await self.bot.on_message(trap_post(spammer, 9, self.trap))
+        self.assertIn("Timeout failed (HTTP 403)", str(self.sent[0]["embed"].fields))
+        self.assertEqual(self.bot.traps.traps[1].count, 0)
+        self.notice.edit.assert_not_awaited()
+        self.assertNotIn((1, spammer.id), self.bot.trapped)  # a later message may retry
+
+
+class TrapChannelCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.bot, self.log_channel = make_bot(self, AsyncMock())
+        self.channel = text_channel(
+            AsyncMock(return_value=SimpleNamespace(id=500)), channel_id=TRAP_CHANNEL
+        )
+        self.channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True,
+            send_messages=True,
+            embed_links=True,
+            read_message_history=True,
+            manage_messages=True,
+        )
+        self.old_notice = SimpleNamespace(id=400, channel=self.channel, delete=AsyncMock())
+        self.channel.get_partial_message.return_value = self.old_notice
+        channels = {999: self.log_channel, TRAP_CHANNEL: self.channel}
+        self.bot.get_channel = MagicMock(side_effect=channels.get)
+        self.commands = self.bot.tree.get_command("trapchannel")
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def answer(self, action):
+        action.response.send_message.assert_awaited_once()
+        return action.response.send_message.await_args.args[0]
+
+    async def run_command(self, name, action, *args):
+        await self.commands.get_command(name).callback(self.commands, action, *args)
+
+    def test_command_options(self):
+        data = self.commands.to_dict(self.bot.tree)
+        self.assertEqual(int(data["default_member_permissions"]), 32)  # Manage Server
+        options = {o["name"]: o for o in data["options"][0]["options"]}
+        self.assertEqual(list(options), ["channel", "timeout", "delete_messages"])
+        self.assertEqual(
+            [c["value"] for c in options["timeout"]["choices"]], [60, 1440, 10080, 40320]
+        )
+
+    async def test_set_posts_notice_saves_and_replaces_old_notice(self):
+        self.bot.traps.set(1, Trap(TRAP_CHANNEL, notice_id=400, count=5))
+        action = interaction()
+        week = discord.app_commands.Choice(name="1 week", value=10080)
+        await self.run_command("set", action, self.channel, week, None)
+
+        kwargs = self.channel.send.await_args.kwargs
+        self.assertIn("DO NOT SEND", kwargs["embed"].title)
+        self.assertIn("7 days", kwargs["embed"].description)
+        self.assertEqual(kwargs["view"].children[0].label, "Timeouts: 5")
+        self.assertEqual(
+            TrapStore(self.bot.traps.path).traps[1],
+            Trap(TRAP_CHANNEL, timeout_minutes=10080, delete_minutes=60, notice_id=500, count=5),
+        )
+        self.assertIn("timed out for 7 days", self.answer(action))
+        self.old_notice.delete.assert_awaited_once()
+
+    async def test_set_refuses_log_channel_and_missing_permissions(self):
+        action = interaction()
+        await self.run_command("set", action, self.log_channel, None, None)
+        self.assertIn("log channel", self.answer(action))
+
+        self.channel.permissions_for.return_value.manage_messages = False
+        action = interaction()
+        await self.run_command("set", action, self.channel, None, None)
+        self.assertIn("manage_messages", self.answer(action))
+        self.channel.send.assert_not_awaited()
+        self.assertEqual(self.bot.traps.traps, {})
+
+    async def test_show_and_off(self):
+        action = interaction()
+        await self.run_command("show", action)
+        self.assertIn("No trap channel", self.answer(action))
+
+        self.bot.traps.set(1, Trap(TRAP_CHANNEL, notice_id=400, count=2))
+        action = interaction()
+        await self.run_command("show", action)
+        self.assertIn("Caught so far: 2", self.answer(action))
+
+        action = interaction()
+        await self.run_command("off", action)
+        self.assertIn("off", self.answer(action))
+        self.assertEqual(TrapStore(self.bot.traps.path).traps, {})
+        self.old_notice.delete.assert_awaited_once()
 
 
 if __name__ == "__main__":

@@ -31,6 +31,14 @@ def text_channel(send, channel_id=999, guild_id=1):
     return channel
 
 
+def notice_parts(view):
+    """The trap notice's text and its counter button, which sit inside one box."""
+    items = list(view.walk_children())
+    text = "\n".join(i.content for i in items if isinstance(i, discord.ui.TextDisplay))
+    button = next(i for i in items if isinstance(i, discord.ui.Button))
+    return text, button
+
+
 def make_bot(test, send, **settings):
     """A bot whose server 1 logs to channel 999, with settings saved in a temp folder."""
     folder = tempfile.TemporaryDirectory()
@@ -627,9 +635,14 @@ class TrapChannelBotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(TrapStore(self.bot.traps.path).traps[1].count, 1)
         self.trap_channel.get_partial_message.assert_called_once_with(77)
-        view = self.notice.edit.await_args.kwargs["view"]
-        self.assertEqual(view.children[0].label, "Timeouts: 1")
-        self.assertTrue(view.children[0].disabled)
+        edit = self.notice.edit.await_args.kwargs
+        self.assertIsNone(edit["embed"])  # turns an old embed notice into the new layout
+        self.assertTrue(edit["view"].has_components_v2())
+        self.assertIsInstance(edit["view"].children[0], discord.ui.Container)
+        text, button = notice_parts(edit["view"])
+        self.assertIn("DO NOT SEND", text)
+        self.assertEqual(button.label, "Timeouts: 1")
+        self.assertTrue(button.disabled)
 
         # Discord's delete events for these are not logged as ordinary deletions.
         await self.bot.on_raw_bulk_message_delete(
@@ -727,9 +740,11 @@ class TrapChannelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(action.response.deferred)  # answered before posting the notice
 
         kwargs = self.channel.send.await_args.kwargs
-        self.assertIn("DO NOT SEND", kwargs["embed"].title)
-        self.assertIn("7 days", kwargs["embed"].description)
-        self.assertEqual(kwargs["view"].children[0].label, "Timeouts: 5")
+        self.assertNotIn("embed", kwargs)
+        text, button = notice_parts(kwargs["view"])
+        self.assertIn("DO NOT SEND", text)
+        self.assertIn("7 days", text)
+        self.assertEqual(button.label, "Timeouts: 5")
         self.assertEqual(
             TrapStore(self.bot.traps.path).traps[1],
             Trap(TRAP_CHANNEL, timeout_minutes=10080, delete_minutes=60, notice_id=500, count=5),

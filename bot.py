@@ -775,9 +775,12 @@ class ModeratorBot(discord.Client):
         channel = self.trap_channel_for(guild_id)
         if channel is None or trap.notice_id is None:
             return
-        view = counter_view(trap.count)
+        view = trap_notice(trap, notice_image(self, channel.guild))
         try:
-            await channel.get_partial_message(trap.notice_id).edit(view=view)
+            # Clearing the embed also turns a notice from an older version into the new layout.
+            await channel.get_partial_message(trap.notice_id).edit(
+                content=None, embed=None, view=view
+            )
         except discord.HTTPException as exc:
             log.warning(
                 "Could not update the trap notice in server %s (HTTP %s)", guild_id, exc.status
@@ -985,12 +988,10 @@ class TrapChannelCommands(
             delete_minutes=delete_messages.value if delete_messages else 60,
             count=old.count if old else 0,
         )
-        view = counter_view(trap.count)
+        view = trap_notice(trap, notice_image(self.bot, guild))
         await acknowledge(interaction)
         try:
-            notice = await channel.send(
-                embed=trap_notice(trap), view=view, allowed_mentions=discord.AllowedMentions.none()
-            )
+            notice = await channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as exc:
             await reply(interaction, f"I could not post in {channel.mention} (HTTP {exc.status}).")
             return
@@ -1059,31 +1060,36 @@ class TrapChannelCommands(
         await delete_notice(self.bot, trap)
 
 
-def trap_notice(trap: Trap) -> discord.Embed:
-    """The warning posted in the trap channel."""
-    return discord.Embed(
-        title="DO NOT SEND MESSAGES IN THIS CHANNEL",
-        description=(
-            "This channel is used to catch spam bots. Anyone who sends a message here is "
-            f"**timed out for {format_minutes(trap.timeout_minutes)}**, and their messages "
-            f"from the last {format_minutes(trap.delete_minutes)} are deleted."
-        ),
-        colour=discord.Colour.red(),
-    )
+def trap_notice(trap: Trap, image_url: str | None = None) -> discord.ui.LayoutView:
+    """The warning posted in the trap channel, with the catch counter inside the same box.
 
-
-def counter_view(count: int) -> discord.ui.View:
-    """A greyed-out button under the notice that shows how many members were caught.
-
+    The whole box is sent again on every edit, so it needs the full trap settings.
     Call stop() on it after sending, so the bot does not keep it in memory.
     """
-    view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Button(
-            label=f"Timeouts: {count:,}", style=discord.ButtonStyle.secondary, disabled=True
-        )
+    heading = discord.ui.TextDisplay("## DO NOT SEND MESSAGES IN THIS CHANNEL")
+    body = discord.ui.TextDisplay(
+        "This channel is used to catch spam bots. Anyone who sends a message here is "
+        f"**timed out for {format_minutes(trap.timeout_minutes)}**, and their messages "
+        f"from the last {format_minutes(trap.delete_minutes)} are deleted."
     )
+    text: list[discord.ui.Item] = (
+        [discord.ui.Section(heading, body, accessory=discord.ui.Thumbnail(image_url))]
+        if image_url
+        else [heading, body]
+    )
+    counter = discord.ui.Button(
+        label=f"Timeouts: {trap.count:,}", style=discord.ButtonStyle.secondary, disabled=True
+    )
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(discord.ui.Container(*text, discord.ui.ActionRow(counter)))
     return view
+
+
+def notice_image(bot: ModeratorBot, guild: discord.Guild) -> str | None:
+    """The picture beside the trap notice: the server icon, or else the bot's avatar."""
+    if icon := getattr(guild, "icon", None):
+        return icon.url
+    return bot.user.display_avatar.url if bot.user else None
 
 
 async def delete_notice(bot: ModeratorBot, trap: Trap) -> None:

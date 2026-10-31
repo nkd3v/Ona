@@ -140,7 +140,9 @@ Anyone who posts there anyway is caught:
    deleted, the result, and a transcript.
 
 When you set it up, the bot posts a "DO NOT SEND MESSAGES IN THIS CHANNEL" notice in
-the channel with a greyed-out **Timeouts:** button that counts everyone caught.
+the channel: one box with the warning, the server icon and a greyed-out **Timeouts:**
+counter inside it that goes up with each catch. Run `/trapchannel set` again to replace a
+notice from an older version straight away; otherwise it changes on the next catch.
 
 | Command | What it does |
 | --- | --- |

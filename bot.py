@@ -1,4 +1,4 @@
-"""Log message deletions, remove scam posts and run a spam-bot trap channel in Discord servers."""
+"""Log deleted and edited messages, remove scam posts and run a spam-bot trap channel."""
 
 from __future__ import annotations
 
@@ -249,6 +249,40 @@ def transcript(
     return "\n".join(lines) + "\n"
 
 
+def edit_transcript(before: discord.Message | None, after: discord.Message) -> str:
+    def version(label: str, message: discord.Message) -> list[str]:
+        lines = [f"{label}:", message.content or "[No text content]"]
+        if message.attachments:
+            lines.append(f"{label} attachments:")
+            lines.extend(f"- {item.filename}: {item.url}" for item in message.attachments)
+        return lines
+
+    lines = [
+        "Edited-message log",
+        f"Recorded at: {datetime.now(UTC).isoformat()}",
+        f"Server ID: {after.guild.id}",
+        f"Channel ID: {after.channel.id}",
+        f"Message ID: {after.id}",
+        f"Link: {after.jump_url}",
+        f"Author: {after.author} (ID: {after.author.id})",
+        f"Sent at: {after.created_at.isoformat()}",
+        f"Edited at: {after.edited_at.isoformat() if after.edited_at else 'unknown'}",
+        "",
+    ]
+    if before is None:
+        lines.append("Before: unavailable, the message was not in the bot's cache.")
+    else:
+        lines.extend(version("Before", before))
+    lines.append("")
+    lines.extend(version("After", after))
+    return "\n".join(lines) + "\n"
+
+
+# A real edit stamps the message with the edit time. Other updates, such as a link
+# preview loading or a pin, repeat the old stamp, so an old stamp means no new edit.
+RECENT_EDIT = timedelta(minutes=5)
+
+
 class ModeratorBot(discord.Client):
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.none()
@@ -444,6 +478,72 @@ class ModeratorBot(discord.Client):
             log.exception(
                 "Could not log %s deletion(s) from channel %s", len(message_ids), channel_id
             )
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        await self.log_edit(payload.cached_message, payload.message)
+
+    @staticmethod
+    def is_text_edit(before: discord.Message | None, after: discord.Message) -> bool:
+        """Whether the author changed the text or removed files, not just a preview or pin."""
+        if before is not None:
+            return before.content != after.content or {a.id for a in before.attachments} != {
+                a.id for a in after.attachments
+            }
+        # Without the old copy, trust only a fresh edit stamp.
+        return after.edited_at is not None and datetime.now(UTC) - after.edited_at < RECENT_EDIT
+
+    async def log_edit(self, before: discord.Message | None, after: discord.Message) -> None:
+        # Bots, including this one, edit their own posts constantly; skip them.
+        if after.guild is None or after.author.bot or not self.is_text_edit(before, after):
+            return
+        channel = self.log_channel_for(after.guild.id)
+        if channel is None or after.channel.id == channel.id:
+            return
+
+        author = after.author
+        embed = discord.Embed(
+            title="Message edited",
+            description=f"[Jump to message]({after.jump_url})",
+            colour=discord.Colour.blue(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.add_field(
+            name="Channel", value=f"<#{after.channel.id}> (`{after.channel.id}`)", inline=False
+        )
+        embed.add_field(
+            name="Author",
+            value=f"<@{author.id}> {shorten(str(author), 200)} (`{author.id}`)",
+            inline=False,
+        )
+        if before is None:
+            old_text = "Unavailable: the message was not in my cache."
+        else:
+            old_text = shorten(before.content or "[No text content]", 1024)
+        embed.add_field(name="Before", value=old_text, inline=False)
+        embed.add_field(
+            name="After", value=shorten(after.content or "[No text content]", 1024), inline=False
+        )
+        if before is not None:
+            kept = {item.id for item in after.attachments}
+            removed = [item.filename for item in before.attachments if item.id not in kept]
+            if removed:
+                embed.add_field(
+                    name="Removed attachments",
+                    value=shorten(", ".join(removed), 1024),
+                    inline=False,
+                )
+        embed.set_footer(text=f"Message ID: {after.id}")
+
+        data = edit_transcript(before, after).encode("utf-8")
+        try:
+            filename = f"edited-{after.id}.txt"
+            with closing(discord.File(io.BytesIO(data), filename=filename)) as file:
+                await channel.send(
+                    embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none()
+                )
+        except discord.HTTPException:
+            # Do not print potentially sensitive message contents to application logs.
+            log.exception("Could not log edit of message %s", after.id)
 
     # Scam filter
 
@@ -752,7 +852,7 @@ class LogChannelCommands(
         super().__init__()
         self.bot = bot
 
-    @app_commands.command(name="set", description="Post deletion and scam logs in a channel")
+    @app_commands.command(name="set", description="Post deletion, edit and scam logs in a channel")
     @app_commands.describe(channel="A private channel that only moderators can read")
     async def set_channel(
         self, interaction: discord.Interaction, channel: discord.TextChannel
@@ -771,7 +871,8 @@ class LogChannelCommands(
         embed = discord.Embed(
             title="Moderation log channel",
             description=(
-                "Deleted messages and removed scam posts from this server will be logged here. "
+                "Deleted and edited messages and removed scam posts from this server will be "
+                "logged here. "
                 "Keep this channel private to moderators."
             ),
             colour=discord.Colour.green(),

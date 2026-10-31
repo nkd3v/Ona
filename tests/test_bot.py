@@ -750,3 +750,108 @@ class TrapChannelCommandTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def edited(content, message_id=10, channel_id=2, attachments=(), edited_at=None, author_bot=False):
+    """A server message as Discord sends it after an edit."""
+    if edited_at is None:
+        edited_at = datetime.now(UTC)
+    return SimpleNamespace(
+        id=message_id,
+        guild=SimpleNamespace(id=1),
+        channel=SimpleNamespace(id=channel_id),
+        author=SimpleNamespace(id=42, bot=author_bot),
+        content=content,
+        attachments=list(attachments),
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        edited_at=edited_at,
+        jump_url=f"https://discord.com/channels/1/{channel_id}/{message_id}",
+    )
+
+
+def file(attachment_id, filename):
+    return SimpleNamespace(
+        id=attachment_id, filename=filename, url=f"https://example.com/{filename}"
+    )
+
+
+class EditLogTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.sent = []
+
+        async def send(**kwargs):
+            self.sent.append(
+                {
+                    "embed": kwargs["embed"],
+                    "text": kwargs["file"].fp.read().decode("utf-8"),
+                    "filename": kwargs["file"].filename,
+                    "mentions": kwargs["allowed_mentions"].to_dict(),
+                }
+            )
+
+        self.bot, self.channel = make_bot(self, send)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def fields(self, index=0):
+        return {field.name: field.value for field in self.sent[index]["embed"].fields}
+
+    async def edit(self, before, after):
+        await self.bot.on_raw_message_edit(SimpleNamespace(cached_message=before, message=after))
+
+    async def test_cached_edit_shows_before_and_after_without_pings(self):
+        await self.edit(edited("hello @everyone", edited_at=None), edited("goodbye"))
+        self.assertEqual(len(self.sent), 1)
+        embed = self.sent[0]["embed"]
+        self.assertEqual(embed.title, "Message edited")
+        self.assertIn("https://discord.com/channels/1/2/10", embed.description)
+        fields = self.fields()
+        self.assertEqual(fields["Before"], "hello @everyone")
+        self.assertEqual(fields["After"], "goodbye")
+        self.assertIn("`42`", fields["Author"])
+        self.assertEqual(self.sent[0]["mentions"]["parse"], [])
+        self.assertEqual(self.sent[0]["filename"], "edited-10.txt")
+        self.assertIn("Before:\nhello @everyone", self.sent[0]["text"])
+        self.assertIn("After:\ngoodbye", self.sent[0]["text"])
+
+    async def test_long_edit_fits_embed_and_transcript_keeps_full_text(self):
+        long = "😀" * 4000
+        await self.edit(edited(long), edited(long + "!"))
+        self.assertLessEqual(len(self.sent[0]["embed"]), 6000)
+        self.assertIn(long + "!", self.sent[0]["text"])
+
+    async def test_removed_attachment_is_listed(self):
+        before = edited("look", attachments=[file(1, "a.png"), file(2, "b.png")])
+        await self.edit(before, edited("look", attachments=[file(1, "a.png")]))
+        self.assertEqual(self.fields()["Removed attachments"], "b.png")
+        self.assertIn("b.png: https://example.com/b.png", self.sent[0]["text"])
+
+    async def test_uncached_fresh_edit_is_logged_without_old_text(self):
+        await self.edit(None, edited("new text"))
+        self.assertIn("not in my cache", self.fields()["Before"])
+        self.assertIn("not in the bot's cache", self.sent[0]["text"])
+
+    async def test_updates_that_are_not_edits_are_ignored(self):
+        # A link preview loading on a cached message: same text and files.
+        await self.edit(edited("https://example.com"), edited("https://example.com"))
+        # Uncached and never edited, or edited long ago (e.g. a pin).
+        await self.edit(None, SimpleNamespace(**{**vars(edited("x")), "edited_at": None}))
+        await self.edit(None, edited("x", edited_at=datetime.now(UTC) - timedelta(hours=1)))
+        self.assertEqual(self.sent, [])
+
+    async def test_bots_dms_log_channel_and_unset_servers_are_ignored(self):
+        await self.edit(edited("a"), edited("b", author_bot=True))
+        await self.edit(edited("a", channel_id=999), edited("b", channel_id=999))
+        await self.edit(edited("a"), SimpleNamespace(**{**vars(edited("b")), "guild": None}))
+        self.bot.store.channels = {}
+        await self.edit(edited("a"), edited("b"))
+        self.assertEqual(self.sent, [])
+
+    async def test_send_failure_is_reported_without_message_text(self):
+        response = SimpleNamespace(status=403, reason="Forbidden")
+        self.channel.send = AsyncMock(side_effect=discord.Forbidden(response, "Denied"))
+        with self.assertLogs("bot", level="ERROR") as captured:
+            await self.edit(edited("secret before"), edited("secret after"))
+        self.assertIn("Could not log edit", captured.output[0])
+        self.assertNotIn("secret", captured.output[0])

@@ -6,6 +6,9 @@ A Python bot for Discord servers that:
   and bulk purges, with author IDs, channel IDs, message IDs, timestamps, cached
   message text, and attachment filenames/links. Each event includes a downloadable
   text transcript. Logged mentions do not send notifications.
+- posts edited-message logs into the same channel, showing the text before and after
+  the edit, any attachments removed, and a link to the message. See
+  [Edited messages](#edited-messages).
 - automatically deletes scam posts, such as the "MrBeast crypto casino" (wispwin.com)
   images posted by hacked accounts, and times out the poster. See
   [Scam filter](#scam-filter).
@@ -46,7 +49,8 @@ A Python bot for Discord servers that:
    See [Choosing the log channel](#choosing-the-log-channel).
 6. Optionally, run `/trapchannel set` to catch spam bots. See [Trap channel](#trap-channel).
 7. Send a message in another channel the bot can view, then delete it. Check the
-   moderator log channel for an embed and transcript. Try a bulk purge too.
+   moderator log channel for an embed and transcript. Try a bulk purge too, and edit
+   a message to see an edit log.
 
 Direct messages and deletions inside the log channel are ignored. Keep the process
 running on your computer or a host to receive deletion events. Permission or
@@ -60,7 +64,7 @@ may use them in **Server Settings → Integrations**.
 
 | Command | What it does |
 | --- | --- |
-| `/logchannel set channel:` | Log this server's deleted messages and scam removals in that channel |
+| `/logchannel set channel:` | Log this server's deleted and edited messages and scam removals in that channel |
 | `/logchannel show` | Show the current log channel |
 | `/logchannel off` | Stop logging and the scam filter in this server |
 
@@ -164,6 +168,19 @@ Discord has no way to delete one person's messages short of banning them, so the
 deletes the messages it has in its memory (see below). Messages sent before the bot
 last started, or older than its cache, are not deleted.
 
+## Edited messages
+
+When a member edits a message, the log channel gets a blue "Message edited" embed
+with the author, channel, a **Jump to message** link, the text before and after, and
+any attachments the edit removed. The attached transcript has the full text of both
+versions and attachment links. Long text is cut short in the embed but not in the
+transcript.
+
+The old text comes from the bot's message cache (see below). For a message that is
+not in the cache, the log shows only the new text. Edits by bots, including this
+one, and edits inside the log channel are not logged. Updates that do not change the
+text or files, such as a link preview loading or a message being pinned, are ignored.
+
 ## What can be recovered?
 
 Discord deletion events do not include deleted text. The bot uses discord.py's
@@ -171,7 +188,8 @@ in-memory cache, configured by `MESSAGE_CACHE_SIZE` (default: 10,000 recent mess
 across all visible channels). Older messages, messages sent before startup, and
 messages unseen while disconnected may lack content; those deletions still produce
 a log with the available IDs. Restarting clears the cache. There is no history
-backfill or local message database. Message edits update the library cache.
+backfill or local message database. Message edits update the cache, so a deletion
+log shows the latest version of an edited message.
 
 The transcript records text and attachment metadata, not copies of uploaded files,
 rich embeds, stickers, or polls. Attachment URLs may expire or stop working after

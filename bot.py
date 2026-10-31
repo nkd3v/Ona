@@ -879,6 +879,7 @@ class LogChannelCommands(
             timestamp=datetime.now(UTC),
         )
         embed.set_footer(text=f"Set by {shorten(str(interaction.user), 100)}")
+        await acknowledge(interaction)
         try:
             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as exc:
@@ -985,6 +986,7 @@ class TrapChannelCommands(
             count=old.count if old else 0,
         )
         view = counter_view(trap.count)
+        await acknowledge(interaction)
         try:
             notice = await channel.send(
                 embed=trap_notice(trap), view=view, allowed_mentions=discord.AllowedMentions.none()
@@ -1094,11 +1096,23 @@ async def delete_notice(bot: ModeratorBot, trap: Trap) -> None:
     )
 
 
+async def acknowledge(interaction: discord.Interaction) -> None:
+    """Show "thinking..." before slow work.
+
+    Discord drops a command that gets no answer within 3 seconds. After this, reply() can
+    answer up to 15 minutes later.
+    """
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+
 async def reply(interaction: discord.Interaction, text: str) -> None:
     """Answer only the person who ran the command."""
-    await interaction.response.send_message(
-        text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
-    )
+    mentions = discord.AllowedMentions.none()
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True, allowed_mentions=mentions)
+    else:
+        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=mentions)
 
 
 def message_parts(message: discord.Message) -> tuple[str, list[discord.Attachment]]:

@@ -253,12 +253,32 @@ def interaction(guild_id=1):
             guild_permissions=SimpleNamespace(manage_messages=True, moderate_members=True)
         ),
     )
+    response = SimpleNamespace(deferred=False, send_message=AsyncMock())
+    response.is_done = lambda: response.deferred or response.send_message.await_count > 0
+
+    async def defer(**kwargs):
+        response.deferred = True
+
+    response.defer = AsyncMock(side_effect=defer)
     return SimpleNamespace(
         guild=guild,
         guild_id=guild_id,
         user="admin",
-        response=SimpleNamespace(send_message=AsyncMock()),
+        response=response,
+        followup=SimpleNamespace(send=AsyncMock()),
     )
+
+
+def answer_text(test, action):
+    """The one private answer a command sent, directly or after "thinking..."."""
+    sent = action.response.send_message
+    if action.response.deferred:
+        test.assertTrue(action.response.defer.await_args.kwargs["ephemeral"])
+        sent.assert_not_awaited()
+        sent = action.followup.send
+    sent.assert_awaited_once()
+    test.assertTrue(sent.await_args.kwargs["ephemeral"])
+    return sent.await_args.args[0]
 
 
 ALL_LOG_PERMISSIONS = SimpleNamespace(
@@ -276,10 +296,7 @@ class LogChannelCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.close()
 
     def answer(self, action):
-        action.response.send_message.assert_awaited_once()
-        call = action.response.send_message.await_args
-        self.assertTrue(call.kwargs["ephemeral"])
-        return call.args[0]
+        return answer_text(self, action)
 
     async def run_command(self, name, action, *args):
         await self.commands.get_command(name).callback(self.commands, action, *args)
@@ -292,6 +309,7 @@ class LogChannelCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_set_saves_channel_and_posts_confirmation(self):
         self.channel.permissions_for.return_value = ALL_LOG_PERMISSIONS
         action = interaction()
+        self.channel.send.side_effect = lambda **kwargs: self.assertTrue(action.response.deferred)
         await self.run_command("set", action, self.channel)
         self.channel.send.assert_awaited_once()
         self.assertIn("<#999>", self.answer(action))
@@ -687,8 +705,7 @@ class TrapChannelCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.close()
 
     def answer(self, action):
-        action.response.send_message.assert_awaited_once()
-        return action.response.send_message.await_args.args[0]
+        return answer_text(self, action)
 
     async def run_command(self, name, action, *args):
         await self.commands.get_command(name).callback(self.commands, action, *args)
@@ -707,6 +724,7 @@ class TrapChannelCommandTests(unittest.IsolatedAsyncioTestCase):
         action = interaction()
         week = discord.app_commands.Choice(name="1 week", value=10080)
         await self.run_command("set", action, self.channel, week, None)
+        self.assertTrue(action.response.deferred)  # answered before posting the notice
 
         kwargs = self.channel.send.await_args.kwargs
         self.assertIn("DO NOT SEND", kwargs["embed"].title)

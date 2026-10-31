@@ -15,6 +15,8 @@ A Python bot for Discord servers that:
 - runs a trap channel: anyone who posts in a channel marked "do not send messages
   here" is timed out and their recent messages are deleted. Spam bots post
   everywhere, so they fall for it. See [Trap channel](#trap-channel).
+- adds `/timeout` for any length, from minutes to years or permanent, beyond
+  Discord's 28-day limit. See [Long and permanent timeouts](#long-and-permanent-timeouts).
 
 ## Setup
 
@@ -135,7 +137,7 @@ Anyone who posts there anyway is caught:
 
 1. Their message is deleted, along with all their messages from the last hour (or the
    period you choose) in every channel the bot can see.
-2. They are timed out for 1 day (or the period you choose).
+2. They are timed out for 1 day (or the period you choose, up to permanent).
 3. The moderator log channel gets a red "Trap channel triggered" embed with what was
    deleted, the result, and a transcript.
 
@@ -146,7 +148,7 @@ notice from an older version straight away; otherwise it changes on the next cat
 
 | Command | What it does |
 | --- | --- |
-| `/trapchannel set channel: timeout: delete_messages:` | Make that channel a trap and post the notice. `timeout` is 1 hour, 1 day (default), 1 week or 28 days. `delete_messages` is how far back to delete: 10 minutes, 1 hour (default), 6 hours or 1 day |
+| `/trapchannel set channel: timeout: delete_messages:` | Make that channel a trap and post the notice. `timeout` is any duration, such as `1h`, `1d` (default), `2w`, `6 months` or `permanent` (see [Long and permanent timeouts](#long-and-permanent-timeouts)). `delete_messages` is how far back to delete: 10 minutes, 1 hour (default), 6 hours or 1 day |
 | `/trapchannel show` | Show the trap channel, its settings and the count |
 | `/trapchannel off` | Stop the trap and remove its notice |
 
@@ -169,6 +171,37 @@ are saved in `data/trap_channels.json`.
 Discord has no way to delete one person's messages short of banning them, so the bot
 deletes the messages it has in its memory (see below). Messages sent before the bot
 last started, or older than its cache, are not deleted.
+
+## Long and permanent timeouts
+
+Discord's own timeout stops at 28 days. These commands go further:
+
+| Command | What it does |
+| --- | --- |
+| `/timeout member: duration: reason:` | Time out a member. `duration` is free text with suggestions: `30m`, `2h`, `3d`, `2w`, `1d 12h`, `6 months`, `1 year` (up to 10 years) or `permanent` |
+| `/untimeout member:` | End a member's timeout, including a permanent one |
+
+Only members with **Timeout Members** see them, and, as in Discord, you can only time
+out members whose highest role is below yours and the bot's. Administrators and the
+server owner cannot be timed out. Each use is logged in the log channel.
+
+Timeouts of up to 28 days are set once. For longer or permanent ones the bot sets a
+block of just under 28 days, saves it in `data/long_timeouts.json`, and checks every
+hour, renewing any block that ends within 2 days. If the bot was offline when a block
+ran out, it renews on its next start. The trap channel uses the same system when its
+`timeout` is longer than 28 days.
+
+The bot stops renewing when:
+
+- the end date is reached,
+- someone runs `/untimeout`, or
+- a moderator removes or changes the timeout from Discord's member menu. The log
+  channel gets a "Long timeout stopped" note.
+
+A timeout survives leaving and rejoining the server until its current block ends.
+The bot cannot see members join (that needs a privileged intent), so if a member
+rejoins after that and posts, the bot deletes the post and times them out again.
+For someone who should never come back, a ban is still the better tool.
 
 ## Edited messages
 

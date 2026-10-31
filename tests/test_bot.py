@@ -10,12 +10,16 @@ import discord
 import bot as bot_module
 import scam_filter
 from bot import (
+    TIMEOUT_BLOCK,
     LogChannelStore,
+    LongTimeout,
+    LongTimeoutStore,
     ModeratorBot,
     Settings,
     Trap,
     TrapStore,
     format_minutes,
+    parse_duration,
     shorten,
     transcript,
 )
@@ -118,6 +122,22 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(format_minutes(2880), "2 days")
         self.assertEqual(format_minutes(120), "2 hours")
         self.assertEqual(format_minutes(1), "1 minute")
+        self.assertEqual(format_minutes(2160), "1 day 12 hours")
+        self.assertEqual(format_minutes(90), "1 hour 30 minutes")
+
+    def test_parse_duration(self):
+        self.assertEqual(parse_duration("30m"), 30)
+        self.assertEqual(parse_duration("2d 12h"), 3600)
+        self.assertEqual(parse_duration("1d12h"), 2160)
+        self.assertEqual(parse_duration("1 Week"), 10080)
+        self.assertEqual(parse_duration("1 day and 2 hours"), 1560)
+        self.assertEqual(parse_duration("6 months"), 6 * 30 * 1440)
+        self.assertEqual(parse_duration("2y"), 2 * 365 * 1440)
+        for word in ("permanent", " Forever ", "perm"):
+            self.assertIsNone(parse_duration(word))
+        for bad in ("", "soon", "30", "5 fortnights", "0m", "11 years", "1d x"):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_duration(bad)
 
     def test_unicode_preview_respects_discord_limit(self):
         result = shorten("😀" * 4000, 3500)
@@ -728,15 +748,12 @@ class TrapChannelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(data["default_member_permissions"]), 32)  # Manage Server
         options = {o["name"]: o for o in data["options"][0]["options"]}
         self.assertEqual(list(options), ["channel", "timeout", "delete_messages"])
-        self.assertEqual(
-            [c["value"] for c in options["timeout"]["choices"]], [60, 1440, 10080, 40320]
-        )
+        self.assertTrue(options["timeout"]["autocomplete"])  # free text with suggestions
 
     async def test_set_posts_notice_saves_and_replaces_old_notice(self):
         self.bot.traps.set(1, Trap(TRAP_CHANNEL, notice_id=400, count=5))
         action = interaction()
-        week = discord.app_commands.Choice(name="1 week", value=10080)
-        await self.run_command("set", action, self.channel, week, None)
+        await self.run_command("set", action, self.channel, "1 week", None)
         self.assertTrue(action.response.deferred)  # answered before posting the notice
 
         kwargs = self.channel.send.await_args.kwargs
@@ -745,6 +762,10 @@ class TrapChannelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("DO NOT SEND", text)
         self.assertIn("7 days", text)
         self.assertEqual(button.label, "Timeouts: 5")
+        box = kwargs["view"].children[0]
+        gap = box.children[-2]  # between the text and the counter
+        self.assertIsInstance(gap, discord.ui.Separator)
+        self.assertFalse(gap.visible)
         self.assertEqual(
             TrapStore(self.bot.traps.path).traps[1],
             Trap(TRAP_CHANNEL, timeout_minutes=10080, delete_minutes=60, notice_id=500, count=5),
@@ -779,6 +800,233 @@ class TrapChannelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("off", self.answer(action))
         self.assertEqual(TrapStore(self.bot.traps.path).traps, {})
         self.old_notice.delete.assert_awaited_once()
+
+    async def test_set_accepts_permanent_and_rejects_bad_duration(self):
+        action = interaction()
+        await self.run_command("set", action, self.channel, "soon", None)
+        self.assertIn("not a duration", self.answer(action))
+        self.channel.send.assert_not_awaited()
+
+        action = interaction()
+        await self.run_command("set", action, self.channel, "permanent", None)
+        text, _ = notice_parts(self.channel.send.await_args.kwargs["view"])
+        self.assertIn("timed out permanently", text)
+        self.assertIsNone(TrapStore(self.bot.traps.path).traps[1].timeout_minutes)
+        self.assertIn("timed out permanently", self.answer(action))
+
+
+def timed_member(member_id=42, until=None, guild=None):
+    """A member whose current timeout ends at `until` (None: not timed out)."""
+    target = member(member_id)
+    target.guild = guild or SimpleNamespace(id=1, owner_id=1)
+    target.timed_out_until = until
+    target.is_timed_out = MagicMock(return_value=until is not None)
+    target.mention = f"<@{member_id}>"
+    target.guild_permissions = SimpleNamespace(manage_messages=False, administrator=False)
+    target.top_role = 1
+    return target
+
+
+class LongTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.logged = []
+
+        async def send(**kwargs):
+            self.logged.append(kwargs["embed"])
+
+        self.bot, _ = make_bot(self, send, scam_images_dir=Path("/nonexistent"))
+        self.guild = SimpleNamespace(id=1, owner_id=1, fetch_member=AsyncMock())
+        self.bot.get_guild = MagicMock(return_value=self.guild)
+        self.now = datetime.now(UTC)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def saved(self):
+        return LongTimeoutStore(self.bot.long_timeouts.path).entries
+
+    async def test_short_timeout_is_set_directly(self):
+        target = timed_member()
+        self.bot.long_timeouts.set((1, 42), LongTimeout(None, self.now + timedelta(days=9)))
+        await self.bot.apply_timeout(target, 40320, "test")
+        self.assertEqual(target.timeout.await_args.args[0], timedelta(days=28))
+        self.assertEqual(self.saved(), {})  # the new, shorter timeout replaced the long one
+
+    async def test_permanent_and_long_timeouts_are_saved_for_renewal(self):
+        target = timed_member()
+        await self.bot.apply_timeout(target, None, "spam")
+        block_end = target.timeout.await_args.args[0]
+        self.assertAlmostEqual(block_end, self.now + TIMEOUT_BLOCK, delta=timedelta(seconds=5))
+        self.assertEqual(self.saved()[1, 42], LongTimeout(None, block_end, "spam"))
+
+        await self.bot.apply_timeout(target, 90 * 1440, "spam")
+        until = self.saved()[1, 42].until
+        self.assertAlmostEqual(until, self.now + timedelta(days=90), delta=timedelta(seconds=5))
+
+    async def test_renews_a_block_that_ends_soon(self):
+        ends = self.now + timedelta(days=1)
+        target = timed_member(until=ends)
+        self.guild.fetch_member.return_value = target
+        self.bot.long_timeouts.set((1, 42), LongTimeout(None, ends, "spam"))
+        # Far from its end, a block is left alone.
+        self.bot.long_timeouts.set((1, 43), LongTimeout(None, self.now + timedelta(days=20)))
+
+        await self.bot.renew_timeouts()
+
+        self.guild.fetch_member.assert_awaited_once_with(42)
+        new_end = target.timeout.await_args.args[0]
+        self.assertAlmostEqual(new_end, self.now + TIMEOUT_BLOCK, delta=timedelta(seconds=5))
+        self.assertEqual(self.saved()[1, 42].applied_until, new_end)
+        self.assertIn("spam", target.timeout.await_args.kwargs["reason"])
+
+    async def test_last_block_ends_at_the_chosen_time(self):
+        ends = self.now + timedelta(days=1)
+        until = self.now + timedelta(days=10)
+        target = timed_member(until=ends)
+        self.guild.fetch_member.return_value = target
+        self.bot.long_timeouts.set((1, 42), LongTimeout(until, ends))
+        await self.bot.renew_timeouts()
+        self.assertEqual(target.timeout.await_args.args[0], until)
+        self.assertEqual(self.saved(), {})  # Discord handles the rest
+
+    async def test_stops_when_a_moderator_removed_or_changed_the_timeout(self):
+        ends = self.now + timedelta(days=1)
+        for current in (None, self.now + timedelta(hours=3)):
+            target = timed_member(until=current)
+            self.guild.fetch_member.return_value = target
+            self.bot.long_timeouts.set((1, 42), LongTimeout(None, ends))
+            await self.bot.renew_timeouts()
+            target.timeout.assert_not_awaited()
+            self.assertEqual(self.saved(), {})
+        self.assertEqual(self.logged[-1].title, "Long timeout stopped")
+
+    async def test_renews_after_the_bot_was_offline(self):
+        target = timed_member(until=None)  # the block ran out while the bot was down
+        self.guild.fetch_member.return_value = target
+        self.bot.long_timeouts.set((1, 42), LongTimeout(None, self.now - timedelta(days=1)))
+        await self.bot.renew_timeouts()
+        target.timeout.assert_awaited_once()
+        self.assertIn((1, 42), self.saved())
+
+    async def test_member_who_left_is_timed_out_again_when_they_post(self):
+        response = SimpleNamespace(status=404, reason="Not Found")
+        self.guild.fetch_member.side_effect = discord.NotFound(response, "Unknown Member")
+        self.bot.long_timeouts.set((1, 42), LongTimeout(None, self.now - timedelta(hours=1)))
+        await self.bot.renew_timeouts()
+        self.assertTrue(self.saved()[1, 42].left)
+
+        await self.bot.renew_timeouts()  # not looked up again
+        self.guild.fetch_member.assert_awaited_once()
+
+        # They rejoin after the block ended and post.
+        target = timed_member(until=None)
+        first, second = post(target, 1), post(target, 2)
+        await self.bot.on_message(first)
+        await self.bot.on_message(second)
+        target.timeout.assert_awaited_once()
+        first.delete.assert_awaited_once()
+        second.delete.assert_awaited_once()
+        self.assertFalse(self.saved()[1, 42].left)
+
+    async def test_post_after_a_moderator_removed_it_is_left_alone(self):
+        self.bot.long_timeouts.set((1, 42), LongTimeout(None, self.now + timedelta(days=5)))
+        target = timed_member(until=None)
+        message = post(target, 1)
+        await self.bot.on_message(message)
+        target.timeout.assert_not_awaited()
+        message.delete.assert_not_awaited()
+        self.assertEqual(self.saved(), {})
+
+    async def test_permanent_trap_timeout(self):
+        self.bot.traps.set(1, Trap(TRAP_CHANNEL, timeout_minutes=None))
+        target = timed_member()
+        with patch.object(ModeratorBot, "cached_messages", new_callable=PropertyMock) as cache:
+            cache.return_value = []
+            await self.bot.on_message(trap_post(target, 9, message_channel(TRAP_CHANNEL)))
+        self.assertIsInstance(target.timeout.await_args.args[0], datetime)
+        self.assertIsNone(self.saved()[1, 42].until)
+        self.assertEqual(self.bot.traps.traps[1].count, 1)
+
+
+def mod_interaction(user_id=7, top_role=5, owner_id=1):
+    action = interaction()
+    action.guild.owner_id = owner_id
+    action.guild.me.top_role = 10
+    action.user = MagicMock(spec=discord.Member)
+    action.user.id = user_id
+    action.user.top_role = top_role
+    action.user.__str__.return_value = "mod"
+    return action
+
+
+class TimeoutCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.logged = []
+
+        async def send(**kwargs):
+            self.logged.append(kwargs["embed"])
+
+        self.bot, _ = make_bot(self, send)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    async def call(self, name, action, *args):
+        action.client = self.bot
+        await self.bot.tree.get_command(name).callback(action, *args)
+        return answer_text(self, action)
+
+    def test_only_moderators_see_the_commands(self):
+        for name in ("timeout", "untimeout"):
+            data = self.bot.tree.get_command(name).to_dict(self.bot.tree)
+            self.assertEqual(int(data["default_member_permissions"]), 1 << 40)
+
+    async def test_suggestions(self):
+        choices = await bot_module.duration_choices(None, "3d")
+        self.assertEqual(choices[0].name, "3d (3 days)")
+        choices = await bot_module.duration_choices(None, "perm")
+        self.assertEqual([c.value for c in choices], ["perm", "permanent"])
+
+    async def test_permanent_timeout_and_untimeout(self):
+        target = timed_member(guild=SimpleNamespace(id=1, owner_id=1))
+        answer = await self.call("timeout", mod_interaction(), target, "permanent", "spam")
+        self.assertIn("timed out permanently", answer)
+        self.assertIn("/untimeout", answer)
+        self.assertIsNone(self.bot.long_timeouts.entries[1, 42].until)
+        self.assertIn("By mod: spam", target.timeout.await_args.kwargs["reason"])
+        self.assertEqual(self.logged[-1].title, "Member timed out")
+        self.assertIn("Permanent", str(self.logged[-1].fields))
+
+        answer = await self.call("untimeout", mod_interaction(), target)
+        self.assertIn("timeout has ended", answer)
+        self.assertIsNone(target.timeout.await_args.args[0])
+        self.assertEqual(self.bot.long_timeouts.entries, {})
+        self.assertEqual(self.logged[-1].title, "Timeout ended")
+
+    async def test_short_timeout(self):
+        target = timed_member()
+        answer = await self.call("timeout", mod_interaction(), target, "2h 30m", None)
+        self.assertIn("timed out for 2 hours 30 minutes", answer)
+        self.assertNotIn("renew", answer)
+        self.assertEqual(target.timeout.await_args.args[0], timedelta(minutes=150))
+
+    async def test_refusals(self):
+        target = timed_member()
+        cases = [
+            (mod_interaction(), "soon", "not a duration"),
+            (mod_interaction(top_role=1), "1d", "Your highest role"),
+            (mod_interaction(user_id=42), "1d", "yourself"),
+        ]
+        for action, duration, expected in cases:
+            self.assertIn(expected, await self.call("timeout", action, target, duration, None))
+        # The owner outranks everyone, but the bot's role must still be higher.
+        target.top_role = 20
+        action = mod_interaction(user_id=1, top_role=0)
+        self.assertIn("My highest role", await self.call("timeout", action, target, "1d", None))
+        target.guild_permissions.administrator = True
+        answer = await self.call("timeout", mod_interaction(), target, "1d", None)
+        self.assertIn("administrators", answer)
+        target.timeout.assert_not_awaited()
 
 
 if __name__ == "__main__":

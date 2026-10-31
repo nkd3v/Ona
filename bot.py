@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
@@ -34,6 +35,31 @@ MODERATION_PERMISSIONS = {
     "ban": ("ban_members",),
 }
 MAX_TIMEOUT_MINUTES = 28 * 24 * 60  # Discord's limit
+# Longer timeouts are set in blocks a little under Discord's limit, and renewed before
+# each block ends. The hourly check renews any block that ends within RENEW_BEFORE.
+TIMEOUT_BLOCK = timedelta(minutes=MAX_TIMEOUT_MINUTES) - timedelta(hours=1)
+RENEW_BEFORE = timedelta(days=2)
+RENEW_CHECK_SECONDS = 3600
+MAX_DURATION_MINUTES = 10 * 365 * 1440  # anything longer should be "permanent"
+DURATION_UNITS = {
+    **dict.fromkeys(("m", "min", "mins", "minute", "minutes"), 1),
+    **dict.fromkeys(("h", "hr", "hrs", "hour", "hours"), 60),
+    **dict.fromkeys(("d", "day", "days"), 1440),
+    **dict.fromkeys(("w", "wk", "wks", "week", "weeks"), 10080),
+    **dict.fromkeys(("mo", "month", "months"), 30 * 1440),
+    **dict.fromkeys(("y", "yr", "yrs", "year", "years"), 365 * 1440),
+}
+DURATION_PART = re.compile(r"(\d+)\s*([a-z]+)")
+PERMANENT_WORDS = frozenset(("permanent", "permanently", "perm", "forever", "indefinite"))
+DURATION_SUGGESTIONS = (
+    "1 hour",
+    "1 day",
+    "1 week",
+    "28 days",
+    "3 months",
+    "1 year",
+    "permanent",
+)
 LOG_CHANNEL_PERMISSIONS = ("view_channel", "send_messages", "embed_links", "attach_files")
 # The trap channel needs these to post its notice and delete what members post there.
 TRAP_CHANNEL_PERMISSIONS = (
@@ -45,7 +71,6 @@ TRAP_CHANNEL_PERMISSIONS = (
 )
 # Server-wide: deleting a caught member's messages in other channels, and timing them out.
 TRAP_SERVER_PERMISSIONS = ("manage_messages", "moderate_members")
-TRAP_TIMEOUT_CHOICES = {"1 hour": 60, "1 day": 1440, "1 week": 10080, "28 days": 40320}
 TRAP_DELETE_CHOICES = {"10 minutes": 10, "1 hour": 60, "6 hours": 360, "1 day": 1440}
 # Remember who was just punished, so a burst of messages gets one timeout and one count.
 ACTION_MEMORY = timedelta(minutes=5)
@@ -161,7 +186,7 @@ class Trap:
     """A server's trap channel: anyone who posts there is treated as a spam bot."""
 
     channel_id: int
-    timeout_minutes: int = 1440
+    timeout_minutes: int | None = 1440  # None: permanent
     delete_minutes: int = 60
     notice_id: int | None = None  # the bot's warning post, which shows the counter
     count: int = 0  # members timed out by the trap so far
@@ -169,9 +194,10 @@ class Trap:
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> Trap:
         notice = raw.get("notice_id")
+        timeout = raw.get("timeout_minutes", 1440)
         return cls(
             channel_id=int(raw["channel_id"]),
-            timeout_minutes=int(raw.get("timeout_minutes", 1440)),
+            timeout_minutes=None if timeout is None else int(timeout),
             delete_minutes=int(raw.get("delete_minutes", 60)),
             notice_id=None if notice is None else int(notice),
             count=int(raw.get("count", 0)),
@@ -201,6 +227,63 @@ class TrapStore:
             traps[guild_id] = trap
         save_json(self.path, {str(k): asdict(v) for k, v in traps.items()})
         self.traps = traps
+
+
+@dataclass(frozen=True)
+class LongTimeout:
+    """A timeout longer than Discord allows in one go, which the bot keeps renewing."""
+
+    until: datetime | None  # None: permanent
+    applied_until: datetime  # when the timeout the bot last set on Discord ends
+    reason: str = ""
+    left: bool = False  # the member left; renewed if they post again after rejoining
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "until": self.until.isoformat() if self.until else None,
+            "applied_until": self.applied_until.isoformat(),
+            "reason": self.reason,
+            "left": self.left,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, object]) -> LongTimeout:
+        until = raw.get("until")
+        return cls(
+            until=None if until is None else datetime.fromisoformat(str(until)),
+            applied_until=datetime.fromisoformat(str(raw["applied_until"])),
+            reason=str(raw.get("reason", "")),
+            left=bool(raw.get("left", False)),
+        )
+
+
+class LongTimeoutStore:
+    """Timeouts the bot renews, keyed by (server ID, member ID) and saved to a JSON file."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.entries: dict[tuple[int, int], LongTimeout] = {}
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            for key, value in raw.items():
+                guild_id, member_id = key.split(":")
+                self.entries[int(guild_id), int(member_id)] = LongTimeout.from_dict(value)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+            raise ValueError(f"Cannot read saved timeouts from {path}: {exc}") from exc
+
+    def set(self, key: tuple[int, int], entry: LongTimeout | None) -> None:
+        """Save a member's long timeout, or forget it when entry is None."""
+        entries = dict(self.entries)
+        if entry is None:
+            if key not in entries:
+                return
+            del entries[key]
+        else:
+            entries[key] = entry
+        save_json(self.path, {f"{g}:{m}": v.to_dict() for (g, m), v in entries.items()})
+        self.entries = entries
 
 
 def shorten(text: str, limit: int) -> str:
@@ -297,6 +380,8 @@ class ModeratorBot(discord.Client):
         self.settings = settings
         self.store = LogChannelStore(settings.data_dir / "log_channels.json")
         self.traps = TrapStore(settings.data_dir / "trap_channels.json")
+        self.long_timeouts = LongTimeoutStore(settings.data_dir / "long_timeouts.json")
+        self.renew_task: asyncio.Task[None] | None = None
         self.known_images = dict(scam_filter.KNOWN_SCAM_IMAGES)
         self.known_images.update(scam_filter.load_image_dir(settings.scam_images_dir))
         self.blocked_domains = scam_filter.domain_pattern(settings.blocked_domains)
@@ -307,9 +392,13 @@ class ModeratorBot(discord.Client):
         self.actioned: dict[tuple[int, int], datetime] = {}
         # (server ID, member ID) -> when the trap channel timed them out.
         self.trapped: dict[tuple[int, int], datetime] = {}
+        # (server ID, member ID) -> when a lapsed long timeout was set again.
+        self.reapplied: dict[tuple[int, int], datetime] = {}
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(LogChannelCommands(self))
         self.tree.add_command(TrapChannelCommands(self))
+        self.tree.add_command(timeout_command)
+        self.tree.add_command(untimeout_command)
 
     async def setup_hook(self) -> None:
         try:
@@ -317,6 +406,12 @@ class ModeratorBot(discord.Client):
         except discord.HTTPException:
             # Logging keeps working with commands registered by an earlier start.
             log.exception("Could not register slash commands with Discord")
+        self.renew_task = asyncio.create_task(self.renew_loop())
+
+    async def close(self) -> None:
+        if self.renew_task is not None:
+            self.renew_task.cancel()
+        await super().close()
 
     def log_channel_for(self, guild_id: int | None) -> discord.TextChannel | None:
         """The server's log channel, if one was set and the bot can still see it."""
@@ -573,6 +668,8 @@ class ModeratorBot(discord.Client):
         return trap if trap is not None and message.channel.id == trap.channel_id else None
 
     async def on_message(self, message: discord.Message) -> None:
+        if await self.enforce_long_timeout(message):
+            return
         if (trap := self.trap_for(message)) is not None:
             await self.spring_trap(message, trap)
             return
@@ -736,10 +833,9 @@ class ModeratorBot(discord.Client):
         if not self.claim(self.trapped, (guild_id, member.id)):
             action = "Already timed out for an earlier message"
         else:
-            minutes = trap.timeout_minutes
             try:
-                await member.timeout(timedelta(minutes=minutes), reason=shorten(reason, 500))
-                action = f"Timed out for {format_minutes(minutes)}"
+                await self.apply_timeout(member, trap.timeout_minutes, reason)
+                action = timeout_text(trap.timeout_minutes).capitalize()
                 caught = True
             except discord.HTTPException as exc:
                 self.trapped.pop((guild_id, member.id), None)
@@ -787,6 +883,128 @@ class ModeratorBot(discord.Client):
             )
         finally:
             view.stop()
+
+    # Timeouts of any length
+
+    def save_long_timeout(self, key: tuple[int, int], entry: LongTimeout | None) -> None:
+        try:
+            self.long_timeouts.set(key, entry)
+        except OSError:
+            log.exception("Could not save the long timeout of member %s", key[1])
+
+    async def apply_timeout(self, member: discord.Member, minutes: int | None, reason: str) -> None:
+        """Time a member out for any length, or permanently (minutes=None).
+
+        Past Discord's 28-day limit the bot saves the timeout and keeps renewing it.
+        Raises discord.HTTPException if Discord refuses.
+        """
+        key = (member.guild.id, member.id)
+        reason = shorten(reason, 500)
+        if minutes is not None and minutes <= MAX_TIMEOUT_MINUTES:
+            await member.timeout(timedelta(minutes=minutes), reason=reason)
+            self.save_long_timeout(key, None)  # a new, shorter timeout replaces a long one
+            return
+        now = datetime.now(UTC)
+        block = now + TIMEOUT_BLOCK
+        await member.timeout(block, reason=reason)
+        until = None if minutes is None else now + timedelta(minutes=minutes)
+        self.save_long_timeout(key, LongTimeout(until, block, reason))
+
+    async def renew_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self.renew_timeouts()
+            except Exception:
+                log.exception("Could not renew long timeouts")
+            await asyncio.sleep(RENEW_CHECK_SECONDS)
+
+    async def renew_timeouts(self) -> None:
+        """Renew each long timeout whose current block ends soon."""
+        now = datetime.now(UTC)
+        for key, entry in list(self.long_timeouts.entries.items()):
+            if entry.left or entry.applied_until - now > RENEW_BEFORE:
+                continue
+            guild = self.get_guild(key[0])
+            if guild is None:
+                continue  # not connected to that server right now; try again later
+            try:
+                member = await guild.fetch_member(key[1])
+            except discord.NotFound:
+                # Without the members intent the bot cannot see them rejoin, so it
+                # renews the timeout if they post again instead.
+                self.save_long_timeout(key, replace(entry, left=True))
+                continue
+            except discord.HTTPException as exc:
+                log.warning("Could not look up member %s (HTTP %s)", key[1], exc.status)
+                continue
+            await self.renew_timeout(member, entry)
+
+    async def renew_timeout(self, member: discord.Member, entry: LongTimeout) -> bool:
+        """Set the next block of a long timeout. False if it ended or a moderator changed it."""
+        key = (member.guild.id, member.id)
+        now = datetime.now(UTC)
+        if entry.until is not None and entry.until <= now:
+            self.save_long_timeout(key, None)
+            return False
+        current = member.timed_out_until if member.is_timed_out() else None
+        if not timeout_is_ours(current, entry, now):
+            # Forget it before awaiting, so a second message does not repeat this.
+            self.save_long_timeout(key, None)
+            log.info("Member %s: long timeout was removed or changed by someone else", member.id)
+            embed = discord.Embed(
+                title="Long timeout stopped",
+                description=(
+                    f"<@{member.id}>'s timeout was removed or changed by someone else, "
+                    "so the bot no longer renews it."
+                ),
+                colour=discord.Colour.orange(),
+                timestamp=now,
+            )
+            await self.post_log(member.guild.id, embed)
+            return False
+        end = now + TIMEOUT_BLOCK
+        final = entry.until is not None and entry.until <= end
+        if final:
+            end = entry.until
+        reason = shorten(f"Renewing a long timeout: {entry.reason or 'no reason given'}", 500)
+        try:
+            await member.timeout(end, reason=reason)
+        except discord.HTTPException as exc:
+            log.warning("Could not renew the timeout of member %s (HTTP %s)", member.id, exc.status)
+            return False
+        self.save_long_timeout(
+            key, None if final else replace(entry, applied_until=end, left=False)
+        )
+        return True
+
+    async def enforce_long_timeout(self, message: discord.Message) -> bool:
+        """Time out again a member whose long timeout lapsed, such as after rejoining.
+
+        Returns True when the message was from such a member and was deleted.
+        """
+        author = message.author
+        if message.guild is None or not isinstance(author, discord.Member):
+            return False
+        key = (message.guild.id, author.id)
+        entry = self.long_timeouts.entries.get(key)
+        if entry is None:
+            return False
+        if self.claim(self.reapplied, key):
+            if not await self.renew_timeout(author, entry):
+                self.reapplied.pop(key, None)
+                return False
+        await self.delete_messages([message], "Posted while under a long timeout")
+        return True
+
+    async def post_log(self, guild_id: int, embed: discord.Embed) -> None:
+        channel = self.log_channel_for(guild_id)
+        if channel is None:
+            return
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.exception("Could not post to the log channel of server %s", guild_id)
 
     async def log_removal(
         self,
@@ -840,6 +1058,141 @@ class ModeratorBot(discord.Client):
                 )
         except discord.HTTPException:
             log.exception("Could not log removal of message %s", message.id)
+
+
+async def duration_choices(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggestions while typing a duration, starting with what was typed if it is valid."""
+    typed = current.strip()
+    choices = []
+    if typed:
+        try:
+            minutes = parse_duration(typed)
+        except ValueError:
+            pass
+        else:
+            label = "permanent" if minutes is None else format_minutes(minutes)
+            choices.append(
+                app_commands.Choice(name=shorten(f"{typed} ({label})", 100), value=typed)
+            )
+    choices += [
+        app_commands.Choice(name=s, value=s)
+        for s in DURATION_SUGGESTIONS
+        if typed.lower() in s and s != typed
+    ]
+    return choices[:25]
+
+
+def timeout_problem(interaction: discord.Interaction, member: discord.Member) -> str | None:
+    """Why the person running /timeout or /untimeout cannot do it to this member, if so."""
+    guild = interaction.guild
+    me = guild.me if guild else None
+    if guild is None or me is None:
+        return "Invite the bot to this server first."
+    if not me.guild_permissions.moderate_members:
+        return "I need the Timeout Members permission first."
+    if member.id == interaction.user.id:
+        return "You cannot do this to yourself."
+    if member.id == guild.owner_id:
+        return "The server owner cannot be timed out."
+    if member.guild_permissions.administrator:
+        return "Discord does not allow timing out administrators."
+    actor = interaction.user
+    if actor.id != guild.owner_id and (
+        not isinstance(actor, discord.Member) or actor.top_role <= member.top_role
+    ):
+        return f"Your highest role must be above {member.mention}'s."
+    if me.top_role <= member.top_role:
+        return f"My highest role must be above {member.mention}'s."
+    return None
+
+
+@app_commands.command(
+    name="timeout", description="Time out a member for any length, or permanently"
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.describe(
+    member="Who to time out",
+    duration="For example 30m, 2h, 3d, 2w, 6 months or permanent",
+    reason="Shown in the audit log and the log channel",
+)
+@app_commands.autocomplete(duration=duration_choices)
+async def timeout_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    duration: app_commands.Range[str, 1, 100],
+    reason: app_commands.Range[str, 1, 400] | None = None,
+) -> None:
+    bot: ModeratorBot = interaction.client
+    if problem := timeout_problem(interaction, member):
+        await reply(interaction, problem)
+        return
+    try:
+        minutes = parse_duration(duration)
+    except ValueError as exc:
+        await reply(interaction, str(exc))
+        return
+    await acknowledge(interaction)
+    audit = f"By {interaction.user}: {reason or 'no reason given'}"
+    try:
+        await bot.apply_timeout(member, minutes, audit)
+    except discord.HTTPException as exc:
+        await reply(interaction, f"Discord refused the timeout (HTTP {exc.status}).")
+        return
+    text = f"{member.mention} is {timeout_text(minutes)}."
+    if minutes is None or minutes > MAX_TIMEOUT_MINUTES:
+        text += (
+            " Discord allows at most 28 days at a time, so I renew it before each block "
+            "ends. Use `/untimeout` to end it early."
+        )
+    await reply(interaction, text)
+    embed = discord.Embed(
+        title="Member timed out",
+        colour=discord.Colour.orange(),
+        timestamp=datetime.now(UTC),
+    )
+    embed.add_field(
+        name="Member", value=f"<@{member.id}> {shorten(str(member), 200)} (`{member.id}`)"
+    )
+    embed.add_field(name="By", value=f"<@{interaction.user.id}>")
+    embed.add_field(
+        name="Duration", value="Permanent" if minutes is None else format_minutes(minutes)
+    )
+    embed.add_field(name="Reason", value=reason or "No reason given", inline=False)
+    await bot.post_log(member.guild.id, embed)
+
+
+@app_commands.command(name="untimeout", description="End a member's timeout, including permanent")
+@app_commands.guild_only()
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.describe(member="Whose timeout to end")
+async def untimeout_command(interaction: discord.Interaction, member: discord.Member) -> None:
+    bot: ModeratorBot = interaction.client
+    if problem := timeout_problem(interaction, member):
+        await reply(interaction, problem)
+        return
+    await acknowledge(interaction)
+    key = (member.guild.id, member.id)
+    saved = bot.long_timeouts.entries.get(key)
+    try:
+        await member.timeout(None, reason=shorten(f"Timeout ended by {interaction.user}", 500))
+    except discord.HTTPException as exc:
+        await reply(interaction, f"Discord refused to end the timeout (HTTP {exc.status}).")
+        return
+    bot.save_long_timeout(key, None)
+    if saved is None and not member.is_timed_out():
+        await reply(interaction, f"{member.mention} was not timed out.")
+        return
+    await reply(interaction, f"{member.mention}'s timeout has ended.")
+    embed = discord.Embed(
+        title="Timeout ended",
+        description=f"<@{member.id}>'s timeout was ended by <@{interaction.user.id}>.",
+        colour=discord.Colour.green(),
+        timestamp=datetime.now(UTC),
+    )
+    await bot.post_log(member.guild.id, embed)
 
 
 class LogChannelCommands(
@@ -951,11 +1304,11 @@ class TrapChannelCommands(
     @app_commands.rename(timeout_for="timeout")
     @app_commands.describe(
         channel="A channel members can see and post in, but are told not to",
-        timeout_for="How long to time out anyone who posts there (default: 1 day)",
+        timeout_for="For example 30m, 2h, 3d, 6 months or permanent (default: 1 day)",
         delete_messages="How far back to delete their messages in every channel (default: 1 hour)",
     )
+    @app_commands.autocomplete(timeout_for=duration_choices)
     @app_commands.choices(
-        timeout_for=[app_commands.Choice(name=k, value=v) for k, v in TRAP_TIMEOUT_CHOICES.items()],
         delete_messages=[
             app_commands.Choice(name=k, value=v) for k, v in TRAP_DELETE_CHOICES.items()
         ],
@@ -964,12 +1317,17 @@ class TrapChannelCommands(
         self,
         interaction: discord.Interaction,
         channel: discord.TextChannel,
-        timeout_for: app_commands.Choice[int] | None = None,
+        timeout_for: app_commands.Range[str, 1, 100] | None = None,
         delete_messages: app_commands.Choice[int] | None = None,
     ) -> None:
         guild = interaction.guild
         if guild is None or guild.me is None:
             await reply(interaction, "Invite the bot to this server first.")
+            return
+        try:
+            timeout_minutes = parse_duration(timeout_for) if timeout_for else 1440
+        except ValueError as exc:
+            await reply(interaction, str(exc))
             return
         if channel.id == self.bot.store.channels.get(guild.id):
             await reply(interaction, "The log channel cannot also be the trap channel.")
@@ -984,7 +1342,7 @@ class TrapChannelCommands(
         old = self.bot.traps.traps.get(guild.id)
         trap = Trap(
             channel.id,
-            timeout_minutes=timeout_for.value if timeout_for else 1440,
+            timeout_minutes=timeout_minutes,
             delete_minutes=delete_messages.value if delete_messages else 60,
             count=old.count if old else 0,
         )
@@ -1013,7 +1371,7 @@ class TrapChannelCommands(
     def describe(self, guild: discord.Guild, trap: Trap) -> str:
         text = (
             f"Trap channel: <#{trap.channel_id}>. Anyone without Manage Messages who posts there "
-            f"is timed out for {format_minutes(trap.timeout_minutes)}, and their messages from "
+            f"is {timeout_text(trap.timeout_minutes)}, and their messages from "
             f"the last {format_minutes(trap.delete_minutes)} are deleted in every channel. "
             f"Caught so far: {trap.count:,}."
         )
@@ -1069,14 +1427,16 @@ def trap_notice(trap: Trap) -> discord.ui.LayoutView:
     heading = discord.ui.TextDisplay("## DO NOT SEND MESSAGES IN THIS CHANNEL")
     body = discord.ui.TextDisplay(
         "This channel is used to catch spam bots. Anyone who sends a message here is "
-        f"**timed out for {format_minutes(trap.timeout_minutes)}**, and their messages "
+        f"**{timeout_text(trap.timeout_minutes)}**, and their messages "
         f"from the last {format_minutes(trap.delete_minutes)} are deleted."
     )
     counter = discord.ui.Button(
         label=f"Timeouts: {trap.count:,}", style=discord.ButtonStyle.secondary, disabled=True
     )
     view = discord.ui.LayoutView(timeout=None)
-    view.add_item(discord.ui.Container(heading, body, discord.ui.ActionRow(counter)))
+    # An invisible divider leaves a gap between the text and the counter.
+    gap = discord.ui.Separator(visible=False, spacing=discord.SeparatorSpacing.large)
+    view.add_item(discord.ui.Container(heading, body, gap, discord.ui.ActionRow(counter)))
     return view
 
 
@@ -1120,13 +1480,55 @@ def message_parts(message: discord.Message) -> tuple[str, list[discord.Attachmen
 
 
 def format_minutes(minutes: int) -> str:
-    if minutes % 1440 == 0:
-        days = minutes // 1440
-        return f"{days} day" + ("s" if days != 1 else "")
-    if minutes % 60 == 0:
-        hours = minutes // 60
-        return f"{hours} hour" + ("s" if hours != 1 else "")
-    return f"{minutes} minute" + ("s" if minutes != 1 else "")
+    days, rest = divmod(minutes, 1440)
+    hours, mins = divmod(rest, 60)
+    parts = [
+        f"{n} {unit}" + ("s" if n != 1 else "")
+        for n, unit in ((days, "day"), (hours, "hour"), (mins, "minute"))
+        if n
+    ]
+    return " ".join(parts) or "0 minutes"
+
+
+def timeout_text(minutes: int | None) -> str:
+    if minutes is None:
+        return "timed out permanently"
+    return f"timed out for {format_minutes(minutes)}"
+
+
+def parse_duration(text: str) -> int | None:
+    """Minutes in a duration such as "90m", "2d 12h" or "6 months"; None means permanent."""
+    cleaned = " ".join(text.lower().replace(",", " ").split()).replace(" and ", " ")
+    if cleaned in PERMANENT_WORDS:
+        return None
+    parts = DURATION_PART.findall(cleaned)
+    if not parts or DURATION_PART.sub("", cleaned).strip():
+        raise ValueError(
+            f"`{shorten(text, 50)}` is not a duration. Try 30m, 2h, 3d, 2w, 6 months or permanent."
+        )
+    try:
+        minutes = sum(int(n) * DURATION_UNITS[unit] for n, unit in parts)
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown unit `{exc.args[0]}`. Use m, h, d, w, months or years."
+        ) from None
+    if minutes < 1:
+        raise ValueError("The duration must be at least 1 minute.")
+    if minutes > MAX_DURATION_MINUTES:
+        raise ValueError("That is over 10 years. Use permanent instead.")
+    return minutes
+
+
+def timeout_is_ours(current: datetime | None, entry: LongTimeout, now: datetime) -> bool:
+    """Whether a member's timeout is still the block the bot set, or ran out unattended.
+
+    No timeout before the block was due to end, or a different end, means someone else
+    removed or changed it.
+    """
+    slack = timedelta(minutes=1)
+    if current is None:
+        return entry.applied_until <= now + slack
+    return abs(current - entry.applied_until) <= slack
 
 
 def main() -> None:

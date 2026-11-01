@@ -9,8 +9,9 @@ A Python bot for Discord servers that:
 - posts edited-message logs into the same channel, showing the text before and after
   the edit, any attachments removed, and a link to the message. See
   [Edited messages](#edited-messages).
-- automatically deletes scam posts, such as the "MrBeast crypto casino" (wispwin.com)
-  images posted by hacked accounts, and times out the poster. See
+- automatically deletes scam posts, such as the "MrBeast crypto casino" (wispwin.com,
+  fapwin.com) images posted by hacked accounts, and times out the poster. It can also
+  read the text in images to catch new versions of the scam. See
   [Scam filter](#scam-filter).
 - runs a trap channel: anyone who posts in a channel marked "do not send messages
   here" is timed out and their recent messages are deleted. Spam bots post
@@ -91,7 +92,8 @@ offer a Python server:
 3. Set the startup file to `bot.py`. `main.py` also works, for panels that default to it.
 4. Add `DISCORD_TOKEN` as an environment variable, marked secret if the panel allows,
    or upload a `.env` file next to `bot.py`. Other settings from `.env.example` are
-   optional.
+   optional. To read text in images, also add `OCR_SPACE_API_KEY` (see
+   [Scam filter](#scam-filter)).
 5. Start the server. The console should show `Logged in as ...`. Then run
    `/logchannel set` in Discord.
 
@@ -104,11 +106,15 @@ The bot checks every new message in the server, including forwarded messages, an
 deletes it when:
 
 1. **An image matches a known scam image.** The bot fingerprints each uploaded image
-   and compares it with the built-in wispwin.com scam images and anything in
-   `scam-images/`. Re-saved, resized, or recompressed copies still match. Heavily
-   cropped or mirrored copies do not.
-2. **It links to a blocked domain** in `BLOCKED_DOMAINS` (default: `wispwin.com`).
-3. **One person posts the same files or link in 3 channels within 2 minutes**, which
+   and compares it with the built-in wispwin.com and fapwin.com scam images and
+   anything in `scam-images/`. Re-saved, resized, or recompressed copies still match.
+   Heavily cropped or mirrored copies do not.
+2. **It links to a blocked domain** in `BLOCKED_DOMAINS` (default: `wispwin.com`,
+   `fapwin.com`).
+3. **The text in an image contains a scam word or a blocked domain** (only with an
+   OCR key, see [Reading text in images](#reading-text-in-images)). The default words
+   are `mrbeast`, `crypto` and `casino`.
+4. **One person posts the same files or link in 3 channels within 2 minutes**, which
    is how hacked accounts usually spam. Every copy is deleted. Plain text without a
    file or link is never counted, so normal chat is left alone.
 
@@ -124,10 +130,35 @@ scanned. To catch a new scam, save its images into `scam-images/` or add its dom
 to `BLOCKED_DOMAINS`, then restart the bot. If the filter removes something it
 should not, lower `SCAM_IMAGE_MATCH_DISTANCE` or set `SPAM_REPEAT_CHANNELS=0`.
 
-Images up to 10 MB are downloaded for checking. Text inside images is not read,
-so a new scam with different images is only caught by the cross-channel rule
-until you add its images or domain. Startup logs a warning if the bot lacks the
-permissions for deleting or timing out.
+Images up to 10 MB are downloaded for checking. Startup logs a warning if the bot
+lacks the permissions for deleting or timing out.
+
+### Reading text in images
+
+The bot sends images to [OCR.space](https://ocr.space/ocrapi), a free online text
+reader, so it uses almost no memory on your host. To turn it on:
+
+1. Register for a free API key at <https://ocr.space/ocrapi>. The key arrives by email.
+2. Set `OCR_SPACE_API_KEY` to that key in `.env` or your host's environment variables.
+3. Restart the bot.
+
+Without a key, text in images is not read, and the startup log says so.
+
+The bot reads an image only when it is not already a known scam image. It sends a
+shrunk JPEG copy (under 1 MB), takes 1 to 5 seconds per image, and remembers the
+last 500 results so reposts of the same image cost nothing. The free plan allows
+25,000 images a month and 500 a day. If OCR.space fails twice in a row, for example
+because the daily limit is used up, the bot stops reading images for 5 minutes and
+logs a warning. The other checks keep working.
+
+`SCAM_IMAGE_WORDS` sets the words, separated by commas. Case, spaces and punctuation
+are ignored, so `mrbeast` also matches "Mr. Beast", and a word also matches inside a
+longer word, so `crypto` matches "cryptocurrency". Any image mentioning these words
+is removed, including harmless ones such as a crypto price chart, so remove a word
+if your server talks about it. Images posted by moderators are never checked.
+
+Images sent for reading leave your server and go to OCR.space. Their
+[privacy policy](https://ocr.space/privacypolicy) says they do not keep them.
 
 ## Trap channel
 

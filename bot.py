@@ -96,6 +96,8 @@ class Settings:
     scam_images_dir: Path = field(default_factory=lambda: BASE_DIR / "scam-images")
     repeat_channels: int = 3
     data_dir: Path = field(default_factory=lambda: BASE_DIR / "data")
+    ocr_api_key: str = ""
+    scam_words: tuple[str, ...] = scam_filter.DEFAULT_SCAM_WORDS
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
@@ -136,6 +138,12 @@ class Settings:
             if domains is None
             else tuple(d.strip() for d in domains.split(",") if d.strip())
         )
+        words = env.get("SCAM_IMAGE_WORDS")
+        scam_words = (
+            scam_filter.DEFAULT_SCAM_WORDS
+            if words is None
+            else tuple(w.strip().lower() for w in words.split(",") if w.strip())
+        )
         return cls(
             token,
             cache_size,
@@ -146,6 +154,8 @@ class Settings:
             scam_images_dir=resolve(env.get("SCAM_IMAGES_DIR") or "scam-images"),
             repeat_channels=repeat_channels,
             data_dir=resolve(env.get("DATA_DIR") or "data"),
+            ocr_api_key=env.get("OCR_SPACE_API_KEY", "").strip(),
+            scam_words=scam_words,
         )
 
 
@@ -386,6 +396,10 @@ class ModeratorBot(discord.Client):
         self.known_images.update(scam_filter.load_image_dir(settings.scam_images_dir))
         self.blocked_domains = scam_filter.domain_pattern(settings.blocked_domains)
         self.repeats = scam_filter.RepeatTracker(settings.repeat_channels)
+        # Reads text in images to find scam words and blocked links; off without a key.
+        self.text_reader = (
+            scam_filter.OcrSpaceReader(settings.ocr_api_key) if settings.ocr_api_key else None
+        )
         # Messages this bot deleted; they get a scam log instead of a deletion log.
         self.removed_ids: set[int] = set()
         # (server ID, member ID) -> when the scam action was applied.
@@ -411,6 +425,8 @@ class ModeratorBot(discord.Client):
     async def close(self) -> None:
         if self.renew_task is not None:
             self.renew_task.cancel()
+        if self.text_reader is not None:
+            await self.text_reader.close()
         await super().close()
 
     def log_channel_for(self, guild_id: int | None) -> discord.TextChannel | None:
@@ -440,6 +456,8 @@ class ModeratorBot(discord.Client):
     async def on_ready(self) -> None:
         # Problems here are logged, not fatal: admins fix them with /logchannel set.
         log.info("Logged in as %s in %s server(s)", self.user, len(self.guilds))
+        if self.text_reader is None:
+            log.info("Text in images is not read; set OCR_SPACE_API_KEY to turn it on.")
         active = 0
         for guild in self.guilds:
             channel_id = self.store.channels.get(guild.id)
@@ -686,7 +704,8 @@ class ModeratorBot(discord.Client):
         if self.blocked_domains and (match := self.blocked_domains.search(text)):
             return f"Blocked link: {match.group(0)}", [message]
 
-        hashes = await self.hash_images(attachments)
+        images = await self.read_images(attachments)
+        hashes = [image[1] if image else None for image in images]
         for value in hashes:
             if value is None:
                 continue
@@ -695,6 +714,8 @@ class ModeratorBot(discord.Client):
             )
             if match:
                 return f"Known scam image: {match[0]} (difference {match[1]})", [message]
+        if (reason := await self.find_scam_text(images)) is not None:
+            return reason, [message]
 
         # Only posts with files or links count, so ordinary chat is never matched.
         if attachments or scam_filter.has_link(text):
@@ -711,8 +732,28 @@ class ModeratorBot(discord.Client):
                 return f"Same post in {channels} channels within 2 minutes", copies
         return None
 
-    async def hash_images(self, attachments: list[discord.Attachment]) -> list[int | None]:
-        async def one(item: discord.Attachment) -> int | None:
+    async def find_scam_text(self, images: list[tuple[bytes, int] | None]) -> str | None:
+        """Why the text in one of the images makes it a scam, or None."""
+        if self.text_reader is None:
+            return None
+        for image in images:
+            if image is None:
+                continue
+            text = await self.text_reader.read(*image)
+            if not text:
+                continue
+            if word := scam_filter.find_word(text, self.settings.scam_words):
+                return f'Scam word in image: "{word}"'
+            if self.blocked_domains and (match := self.blocked_domains.search(text)):
+                return f"Blocked link in image: {match.group(0)}"
+        return None
+
+    async def read_images(
+        self, attachments: list[discord.Attachment]
+    ) -> list[tuple[bytes, int] | None]:
+        """Each image's data and fingerprint, or None for other files and unreadable images."""
+
+        async def one(item: discord.Attachment) -> tuple[bytes, int] | None:
             content_type = item.content_type or ""
             suffix_ok = item.filename.lower().endswith(scam_filter.IMAGE_SUFFIXES)
             is_image = content_type.startswith("image/") or suffix_ok
@@ -723,7 +764,8 @@ class ModeratorBot(discord.Client):
             except (discord.HTTPException, aiohttp.ClientError, TimeoutError):
                 log.warning("Could not download attachment %s for scanning", item.id)
                 return None
-            return await asyncio.to_thread(scam_filter.image_hash, data)
+            value = await asyncio.to_thread(scam_filter.image_hash, data)
+            return None if value is None else (data, value)
 
         return list(await asyncio.gather(*(one(item) for item in attachments)))
 

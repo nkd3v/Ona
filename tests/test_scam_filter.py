@@ -1,10 +1,13 @@
 import io
 import random
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+from aiohttp import web
 from PIL import Image, ImageDraw
 
 import scam_filter as sf
@@ -72,6 +75,99 @@ class TextTests(unittest.TestCase):
         self.assertTrue(sf.has_link("see https://x.io"))
         self.assertTrue(sf.has_link("see bit.ly/abc"))
         self.assertFalse(sf.has_link("hello there. how are you"))
+
+
+class ScamWordTests(unittest.TestCase):
+    def test_finds_words_ignoring_case_spaces_and_punctuation(self):
+        words = sf.DEFAULT_SCAM_WORDS
+        self.assertEqual(sf.find_word("MrBeast (@MrBeast) / X", words), "mrbeast")
+        self.assertEqual(sf.find_word("Mr. Beast giveaway", words), "mrbeast")
+        self.assertEqual(sf.find_word("my own CRYPTOCURRENCY", words), "crypto")
+        self.assertEqual(sf.find_word("online\nCasino", words), "casino")
+        self.assertIsNone(sf.find_word("Withdrawal successful, USDC", words))
+        self.assertIsNone(sf.find_word("anything", ["", " "]))
+
+    def test_ocr_jpeg_shrinks_large_images_and_rejects_junk(self):
+        noisy = Image.effect_noise((4000, 3000), 100).convert("RGB")
+        jpeg = sf.ocr_jpeg(encode(noisy))
+        self.assertLessEqual(len(jpeg), sf.OCR_MAX_BYTES)
+        with Image.open(io.BytesIO(jpeg)) as img:
+            self.assertEqual(max(img.size), sf.OCR_MAX_SIDE)
+        self.assertIsNone(sf.ocr_jpeg(b"not an image"))
+
+
+class OcrSpaceReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.replies = []
+        self.requests = []
+
+        async def handler(request):
+            form = await request.post()
+            self.requests.append((request.headers.get("apikey"), form["OCREngine"]))
+            status, body = self.replies.pop(0)
+            return web.json_response(body, status=status)
+
+        app = web.Application()
+        app.router.add_post("/parse/image", handler)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await site.start()
+        port = self.runner.addresses[0][1]
+        self.reader = sf.OcrSpaceReader("key", url=f"http://127.0.0.1:{port}/parse/image")
+        retry_wait = patch.object(sf, "OCR_RETRY_SECONDS", 0)
+        retry_wait.start()
+        self.addCleanup(retry_wait.stop)
+        self.image = encode(sample_image(1))
+
+    async def asyncTearDown(self):
+        await self.reader.close()
+        await self.runner.cleanup()
+
+    @staticmethod
+    def ok(*texts):
+        return 200, {
+            "IsErroredOnProcessing": False,
+            "ParsedResults": [{"ParsedText": text} for text in texts],
+        }
+
+    async def test_reads_text_and_remembers_it_by_fingerprint(self):
+        self.replies.append(self.ok("MrBeast", "casino"))
+        self.assertEqual(await self.reader.read(self.image, 1), "MrBeast\ncasino")
+        self.assertEqual(await self.reader.read(self.image, 1), "MrBeast\ncasino")
+        self.assertEqual(self.requests, [("key", "2")])
+
+    async def test_one_failure_is_retried(self):
+        self.replies += [(503, {}), self.ok("casino")]
+        with self.assertLogs("scam_filter", level="WARNING") as logs:
+            self.assertEqual(await self.reader.read(self.image, 1), "casino")
+        self.assertEqual(logs.output, ["WARNING:scam_filter:OCR.space request failed: HTTP 503"])
+
+    async def test_two_failures_pause_reading(self):
+        quota = (200, "You may only perform this action upto maximum 500 times")
+        self.replies += [quota, quota]
+        with self.assertLogs("scam_filter", level="WARNING") as logs:
+            self.assertIsNone(await self.reader.read(self.image, 1))
+        self.assertIn("500 times", logs.output[0])
+        self.assertIn("pausing for 5 minutes", logs.output[-1])
+        self.assertIsNone(await self.reader.read(self.image, 2))  # paused: no request
+        self.assertEqual(len(self.requests), 2)
+
+        for reply in (
+            (200, {"IsErroredOnProcessing": True, "ErrorMessage": ["File too large"]}),
+            (403, {}),
+        ):
+            self.reader.paused_until = time.monotonic() - 1
+            self.replies += [reply, reply]
+            with self.subTest(reply=reply), self.assertLogs("scam_filter", level="WARNING"):
+                self.assertIsNone(await self.reader.read(self.image, 3))
+        self.reader.paused_until = time.monotonic() - 1
+        self.replies.append(self.ok("fine"))
+        self.assertEqual(await self.reader.read(self.image, 3), "fine")
+
+    async def test_unreadable_image_is_not_sent(self):
+        self.assertIsNone(await self.reader.read(b"broken", 1))
+        self.assertEqual(self.requests, [])
 
 
 class RepeatTrackerTests(unittest.TestCase):

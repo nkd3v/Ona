@@ -86,8 +86,10 @@ class SettingsTests(unittest.TestCase):
         settings = Settings.from_env(base)
         self.assertEqual(settings.scam_action, "timeout")
         self.assertEqual(settings.timeout_minutes, 1440)
-        self.assertEqual(settings.blocked_domains, ("wispwin.com",))
+        self.assertEqual(settings.blocked_domains, ("wispwin.com", "fapwin.com"))
         self.assertEqual(settings.scam_images_dir, bot_module.BASE_DIR / "scam-images")
+        self.assertEqual(settings.ocr_api_key, "")
+        self.assertEqual(settings.scam_words, ("mrbeast", "crypto", "casino"))
         settings = Settings.from_env(
             base
             | {
@@ -96,8 +98,12 @@ class SettingsTests(unittest.TestCase):
                 "BLOCKED_DOMAINS": "a.com, b.net,",
                 "SCAM_IMAGES_DIR": "/tmp/x",
                 "SPAM_REPEAT_CHANNELS": "0",
+                "OCR_SPACE_API_KEY": " abc ",
+                "SCAM_IMAGE_WORDS": "Airdrop, ,Giveaway",
             }
         )
+        self.assertEqual(settings.ocr_api_key, "abc")
+        self.assertEqual(settings.scam_words, ("airdrop", "giveaway"))
         self.assertEqual(settings.scam_action, "ban")
         self.assertEqual(settings.blocked_domains, ("a.com", "b.net"))
         self.assertEqual(settings.repeat_channels, 0)
@@ -528,6 +534,41 @@ class ScamFilterBotTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.on_message(message)
         message.delete.assert_not_awaited()
         text_file.read.assert_not_awaited()
+
+    async def test_built_in_images_from_both_scam_sites_are_known(self):
+        names = set(scam_filter.KNOWN_SCAM_IMAGES.values())
+        self.assertIn("fapwin bonus page", names)
+        self.assertIn("wispwin bonus page", names)
+
+    def read_text_as(self, text):
+        self.bot.text_reader = SimpleNamespace(read=AsyncMock(return_value=text), close=AsyncMock())
+        return self.bot.text_reader.read
+
+    async def test_scam_word_in_image_text_is_removed(self):
+        read = self.read_text_as("MrBeast @MrBeast\nmy own cryptocurrency CASINO")
+        unknown = encode(sample_image(7))
+        message = post(member(), attachments=[attachment(unknown)])
+        await self.bot.on_message(message)
+        message.delete.assert_awaited_once()
+        self.assertIn('Scam word in image: "mrbeast"', self.sent[0]["embed"].description)
+        data, fingerprint = read.await_args.args
+        self.assertEqual((data, fingerprint), (unknown, scam_filter.image_hash(unknown)))
+
+    async def test_blocked_link_in_image_text_is_removed(self):
+        self.read_text_as("Fapwin | Profile  fapwin.com/profile/bonuses")
+        message = post(member(), attachments=[attachment(encode(sample_image(7)))])
+        await self.bot.on_message(message)
+        message.delete.assert_awaited_once()
+        self.assertIn("Blocked link in image: fapwin.com", self.sent[0]["embed"].description)
+
+    async def test_ordinary_image_text_and_known_images_skip_or_pass(self):
+        read = self.read_text_as("good morning, here is my cat")
+        message = post(member(), attachments=[attachment(encode(sample_image(7)))])
+        await self.bot.on_message(message)
+        message.delete.assert_not_awaited()
+        read.reset_mock()
+        await self.bot.on_message(post(member(), attachments=[attachment(self.scam_png)]))
+        read.assert_not_awaited()  # matched by fingerprint first
 
     async def test_failed_timeout_is_reported_in_log(self):
         author = member()

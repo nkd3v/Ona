@@ -87,7 +87,23 @@ bot starts.
 
 ## Hosting
 
-The bot runs on Pterodactyl-style hosting panels, such as Bot-Hosting.net, that
+### Docker
+
+To run the bot on your own server with Docker, copy the project there, create `.env`
+next to `compose.yaml` (see `.env.example`), and run:
+
+```sh
+docker compose up -d --build
+docker logs -f ona
+```
+
+Saved settings go in `data/` next to `compose.yaml`, so they survive rebuilds. The
+container restarts by itself after a crash or reboot. To update, copy the new files
+over and run `docker compose up -d --build` again.
+
+### Hosting panels
+
+The bot also runs on Pterodactyl-style hosting panels, such as Bot-Hosting.net, that
 offer a Python server:
 
 1. Choose Python 3.11 or newer.

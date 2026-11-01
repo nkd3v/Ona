@@ -1,0 +1,8 @@
+services:
+  ona:
+    build: .
+    container_name: ona
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

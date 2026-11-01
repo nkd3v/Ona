@@ -1,0 +1,10 @@
+.env
+.venv/
+data/
+__pycache__/
+.ruff_cache/
+.git/
+avatar/
+dev-refs/
+tests/
+.DS_Store

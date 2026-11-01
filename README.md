@@ -92,7 +92,7 @@ offer a Python server:
 3. Set the startup file to `bot.py`. `main.py` also works, for panels that default to it.
 4. Add `DISCORD_TOKEN` as an environment variable, marked secret if the panel allows,
    or upload a `.env` file next to `bot.py`. Other settings from `.env.example` are
-   optional. To read text in images, also add `OCR_SPACE_API_KEY` (see
+   optional. To read text in images, also add `GOOGLE_VISION_API_KEY` (see
    [Scam filter](#scam-filter)).
 5. Start the server. The console should show `Logged in as ...`. Then run
    `/logchannel set` in Discord.
@@ -135,21 +135,41 @@ lacks the permissions for deleting or timing out.
 
 ### Reading text in images
 
-The bot sends images to [OCR.space](https://ocr.space/ocrapi), a free online text
-reader, so it uses almost no memory on your host. To turn it on:
+The bot sends images to the [Google Cloud Vision API](https://cloud.google.com/vision),
+so it uses almost no memory on your host. To turn it on:
 
-1. Register for a free API key at <https://ocr.space/ocrapi>. The key arrives by email.
-2. Set `OCR_SPACE_API_KEY` to that key in `.env` or your host's environment variables.
-3. Restart the bot.
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a project
+   and link a billing account to it. Google requires billing even for the free tier.
+2. Enable the [Cloud Vision API](https://console.cloud.google.com/apis/library/vision.googleapis.com)
+   for that project.
+3. Under **APIs & Services > Credentials**, create an API key and restrict it to the
+   Cloud Vision API.
+4. Set `GOOGLE_VISION_API_KEY` to that key in `.env` or your host's environment variables.
+5. Restart the bot.
+
+With the gcloud CLI, steps 1 to 3 are:
+
+```sh
+gcloud projects create my-bot-ocr
+gcloud billing projects link my-bot-ocr --billing-account=BILLING_ACCOUNT_ID
+gcloud services enable vision.googleapis.com apikeys.googleapis.com --project=my-bot-ocr
+gcloud services api-keys create --project=my-bot-ocr --display-name=discord-mod-bot \
+    --api-target=service=vision.googleapis.com
+```
 
 Without a key, text in images is not read, and the startup log says so.
 
 The bot reads an image only when it is not already a known scam image. It sends a
-shrunk JPEG copy (under 1 MB), takes 1 to 5 seconds per image, and remembers the
-last 500 results so reposts of the same image cost nothing. The free plan allows
-25,000 images a month and 500 a day. If OCR.space fails twice in a row, for example
-because the daily limit is used up, the bot stops reading images for 5 minutes and
-logs a warning. The other checks keep working.
+shrunk JPEG copy (under 1 MB), takes about a second per image, and remembers the last
+500 results so reposts of the same image cost nothing.
+
+Google's free tier covers the first 1,000 images a month; after that Google charges
+about $1.50 per 1,000. To stay free, the bot stops reading images once it has sent
+`GOOGLE_VISION_MONTHLY_LIMIT` images (default `1000`) in the month, logs a warning,
+and starts again on the 1st (Pacific time, like Google's billing). The count is saved
+in `DATA_DIR/vision_usage.json`, so restarts keep it. Set the limit higher to allow
+paid use, or `0` for no limit. If Google fails twice in a row, the bot stops reading
+images for 5 minutes and logs a warning. The other checks keep working either way.
 
 `SCAM_IMAGE_WORDS` sets the words, separated by commas. Case, spaces and punctuation
 are ignored, so `mrbeast` also matches "Mr. Beast", and a word also matches inside a
@@ -157,8 +177,9 @@ longer word, so `crypto` matches "cryptocurrency". Any image mentioning these wo
 is removed, including harmless ones such as a crypto price chart, so remove a word
 if your server talks about it. Images posted by moderators are never checked.
 
-Images sent for reading leave your server and go to OCR.space. Their
-[privacy policy](https://ocr.space/privacypolicy) says they do not keep them.
+Images sent for reading leave your server and go to Google. Google's
+[data usage terms](https://cloud.google.com/vision/docs/data-usage) say it keeps them
+only briefly while reading them and does not use them for anything else.
 
 ## Trap channel
 

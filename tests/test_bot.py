@@ -77,6 +77,8 @@ class SettingsTests(unittest.TestCase):
             {"DISCORD_TOKEN": "replace_with_your_bot_token"},
             {"DISCORD_TOKEN": "secret", "MESSAGE_CACHE_SIZE": "abc"},
             {"DISCORD_TOKEN": "secret", "MESSAGE_CACHE_SIZE": "-1"},
+            {"DISCORD_TOKEN": "secret", "GOOGLE_VISION_MONTHLY_LIMIT": "-1"},
+            {"DISCORD_TOKEN": "secret", "GOOGLE_VISION_MONTHLY_LIMIT": "lots"},
         ):
             with self.subTest(env=env), self.assertRaises(ValueError):
                 Settings.from_env(env)
@@ -88,7 +90,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.timeout_minutes, 1440)
         self.assertEqual(settings.blocked_domains, ("wispwin.com", "fapwin.com"))
         self.assertEqual(settings.scam_images_dir, bot_module.BASE_DIR / "scam-images")
-        self.assertEqual(settings.ocr_api_key, "")
+        self.assertEqual(settings.vision_api_key, "")
+        self.assertEqual(settings.vision_monthly_limit, 1000)
         self.assertEqual(settings.scam_words, ("mrbeast", "crypto", "casino"))
         settings = Settings.from_env(
             base
@@ -98,11 +101,13 @@ class SettingsTests(unittest.TestCase):
                 "BLOCKED_DOMAINS": "a.com, b.net,",
                 "SCAM_IMAGES_DIR": "/tmp/x",
                 "SPAM_REPEAT_CHANNELS": "0",
-                "OCR_SPACE_API_KEY": " abc ",
+                "GOOGLE_VISION_API_KEY": " abc ",
+                "GOOGLE_VISION_MONTHLY_LIMIT": "0",
                 "SCAM_IMAGE_WORDS": "Airdrop, ,Giveaway",
             }
         )
-        self.assertEqual(settings.ocr_api_key, "abc")
+        self.assertEqual(settings.vision_api_key, "abc")
+        self.assertEqual(settings.vision_monthly_limit, 0)
         self.assertEqual(settings.scam_words, ("airdrop", "giveaway"))
         self.assertEqual(settings.scam_action, "ban")
         self.assertEqual(settings.blocked_domains, ("a.com", "b.net"))

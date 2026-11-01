@@ -4,14 +4,17 @@ cross-channel spam."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
+import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict, deque
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,12 +44,16 @@ DEFAULT_BLOCKED_DOMAINS = ("wispwin.com", "fapwin.com")
 # are ignored, and a word also matches inside a longer one ("crypto" in "cryptocurrency").
 DEFAULT_SCAM_WORDS = ("mrbeast", "crypto", "casino")
 
-OCR_URL = "https://api.ocr.space/parse/image"
-OCR_MAX_BYTES = 1024 * 1024  # OCR.space free plan limit
+VISION_URL = "https://vision.googleapis.com/v1/images:annotate"
+OCR_MAX_BYTES = 1024 * 1024  # keeps uploads quick; Google allows much larger
 OCR_MAX_SIDE = 1600
 OCR_TIMEOUT_SECONDS = 30
 OCR_RETRY_SECONDS = 3  # wait before the one retry of a failed request
-OCR_PAUSE_SECONDS = 300  # after a retry fails, so a used-up quota does not flood the logs
+OCR_PAUSE_SECONDS = 300  # after a retry fails, so an outage does not flood the logs
+VISION_FREE_IMAGES = 1000  # Google's free text-detection images per month
+# Google's billing month follows Pacific time. A fixed offset is close enough and needs
+# no time zone database on the host.
+BILLING_ZONE = timezone(timedelta(hours=-8), "Pacific")
 
 URL_PATTERN = re.compile(r"https?://\S+|\b(?:[a-z0-9-]+\.)+[a-z]{2,}/\S*", re.IGNORECASE)
 
@@ -147,19 +154,70 @@ def ocr_jpeg(data: bytes) -> bytes | None:
     return None
 
 
-class OcrSpaceReader:
-    """Read text in images with the OCR.space API (free key at https://ocr.space/ocrapi).
+class MonthlyUsage:
+    """Images sent to Google this billing month, saved to a JSON file so restarts keep
+    the count."""
 
-    Results are remembered by image fingerprint, so a reposted image uses no quota.
-    A failed request is retried once. If that fails too, such as when the daily quota
-    is used up, reading pauses for a while.
+    def __init__(self, path: Path | None, limit: int) -> None:
+        self.path = path
+        self.limit = limit  # 0: no limit
+        self.month = ""
+        self.count = 0
+        if path is not None:
+            try:
+                raw = json.loads(path.read_text("utf-8"))
+                self.month, self.count = str(raw["month"]), int(raw["count"])
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                log.warning("Ignoring unreadable image reading count in %s: %s", path, exc)
+
+    def _roll(self, now: datetime | None) -> None:
+        month = (now or datetime.now(UTC)).astimezone(BILLING_ZONE).strftime("%Y-%m")
+        if month != self.month:
+            self.month, self.count = month, 0
+
+    def used_up(self, now: datetime | None = None) -> bool:
+        self._roll(now)
+        return 0 < self.limit <= self.count
+
+    def add(self, now: datetime | None = None) -> None:
+        self._roll(now)
+        self.count += 1
+        if self.path is not None:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temp = self.path.with_suffix(".tmp")
+                temp.write_text(json.dumps({"month": self.month, "count": self.count}), "utf-8")
+                os.replace(temp, self.path)
+            except OSError as exc:
+                log.warning("Could not save the image reading count to %s: %s", self.path, exc)
+
+
+class GoogleVisionReader:
+    """Read text in images with the Google Cloud Vision API (an API key with the Cloud
+    Vision API enabled).
+
+    Results are remembered by image fingerprint, so a reposted image costs nothing.
+    Reading stops for the rest of the month once monthly_limit images were sent, which
+    by default keeps within Google's free tier. A failed request is retried once. If
+    that fails too, reading pauses for a while.
     """
 
-    def __init__(self, api_key: str, url: str = OCR_URL, cache_size: int = 500) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        usage_path: Path | None = None,
+        monthly_limit: int = VISION_FREE_IMAGES,
+        url: str = VISION_URL,
+        cache_size: int = 500,
+    ) -> None:
         self.api_key = api_key
         self.url = url
         self.cache_size = cache_size
         self.cache: OrderedDict[int, str] = OrderedDict()
+        self.usage = MonthlyUsage(usage_path, monthly_limit)
+        self.warned_month = ""
         self.paused_until = 0.0
         self.session: aiohttp.ClientSession | None = None
 
@@ -168,64 +226,86 @@ class OcrSpaceReader:
         if fingerprint in self.cache:
             self.cache.move_to_end(fingerprint)
             return self.cache[fingerprint]
-        if time.monotonic() < self.paused_until:
+        if time.monotonic() < self.paused_until or self._used_up():
             return None
         jpeg = await asyncio.to_thread(ocr_jpeg, data)
         if jpeg is None:
             return None
         text = await self._request(jpeg)
-        if text is None:
+        if text is None and not self._used_up():
             await asyncio.sleep(OCR_RETRY_SECONDS)
             text = await self._request(jpeg)
         if text is None:
-            log.warning(
-                "Could not read text in an image; pausing for %s minutes", OCR_PAUSE_SECONDS // 60
-            )
-            self.paused_until = time.monotonic() + OCR_PAUSE_SECONDS
+            if not self._used_up():
+                log.warning(
+                    "Could not read text in an image; pausing for %s minutes",
+                    OCR_PAUSE_SECONDS // 60,
+                )
+                self.paused_until = time.monotonic() + OCR_PAUSE_SECONDS
             return None
         self.cache[fingerprint] = text
         if len(self.cache) > self.cache_size:
             self.cache.popitem(last=False)
         return text
 
+    def _used_up(self) -> bool:
+        if not self.usage.used_up():
+            return False
+        if self.warned_month != self.usage.month:
+            self.warned_month = self.usage.month
+            log.warning(
+                "Read text in %s images this month, the GOOGLE_VISION_MONTHLY_LIMIT; "
+                "image text is not read again until next month.",
+                self.usage.count,
+            )
+        return True
+
     async def _request(self, jpeg: bytes) -> str | None:
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=OCR_TIMEOUT_SECONDS)
             )
-        form = aiohttp.FormData()
-        form.add_field("OCREngine", "2")
-        form.add_field("file", jpeg, filename="image.jpg", content_type="image/jpeg")
+        payload = {
+            "requests": [
+                {
+                    "image": {"content": base64.b64encode(jpeg).decode("ascii")},
+                    "features": [{"type": "TEXT_DETECTION"}],
+                }
+            ]
+        }
+        # Counted before sending: Google may bill a request whose reply never arrives.
+        self.usage.add()
         body: object = None
         try:
             async with self.session.post(
-                self.url, data=form, headers={"apikey": self.api_key}
+                self.url, json=payload, headers={"X-Goog-Api-Key": self.api_key}
             ) as response:
-                if response.status == 200:
-                    body = await response.json(content_type=None)
-                    problem = _ocr_problem(body)
-                else:
-                    problem = f"HTTP {response.status}"
+                body = await response.json(content_type=None)
+                problem = _vision_problem(response.status, body)
         except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
             problem = type(exc).__name__
         if problem or not isinstance(body, dict):
-            log.warning("OCR.space request failed: %s", problem)
+            log.warning("Google Vision request failed: %s", problem)
             return None
-        return "\n".join(str(page.get("ParsedText", "")) for page in body["ParsedResults"])
+        reply = body["responses"][0]
+        return str(reply.get("fullTextAnnotation", {}).get("text", ""))
 
     async def close(self) -> None:
         if self.session is not None:
             await self.session.close()
 
 
-def _ocr_problem(body: object) -> str | None:
-    """Why an OCR.space reply has no text, or None if it is fine."""
-    if not isinstance(body, dict):
-        return str(body)[:200]  # quota errors come back as a bare string
-    if body.get("IsErroredOnProcessing") or not isinstance(body.get("ParsedResults"), list):
-        message = body.get("ErrorMessage") or "unknown error"
-        return " ".join(message) if isinstance(message, list) else str(message)
-    return None
+def _vision_problem(status: int, body: object) -> str | None:
+    """Why a Google Vision reply has no text, or None if it is fine."""
+    error = body.get("error") if isinstance(body, dict) else None
+    if status == 200 and isinstance(body, dict):
+        replies = body.get("responses")
+        if isinstance(replies, list) and replies and isinstance(replies[0], dict):
+            error = replies[0].get("error")
+            if not error:
+                return None
+    message = error.get("message") if isinstance(error, dict) else None
+    return f"HTTP {status}" + (f": {message}" if message else "")
 
 
 @dataclass

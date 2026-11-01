@@ -96,7 +96,8 @@ class Settings:
     scam_images_dir: Path = field(default_factory=lambda: BASE_DIR / "scam-images")
     repeat_channels: int = 3
     data_dir: Path = field(default_factory=lambda: BASE_DIR / "data")
-    ocr_api_key: str = ""
+    vision_api_key: str = ""
+    vision_monthly_limit: int = scam_filter.VISION_FREE_IMAGES
     scam_words: tuple[str, ...] = scam_filter.DEFAULT_SCAM_WORDS
 
     @classmethod
@@ -121,10 +122,13 @@ class Settings:
             timeout_minutes = int(env.get("SCAM_TIMEOUT_MINUTES", "1440"))
             distance = int(env.get("SCAM_IMAGE_MATCH_DISTANCE", "40"))
             repeat_channels = int(env.get("SPAM_REPEAT_CHANNELS", "3"))
+            vision_limit = int(
+                env.get("GOOGLE_VISION_MONTHLY_LIMIT") or scam_filter.VISION_FREE_IMAGES
+            )
         except ValueError as exc:
             raise ValueError(
-                "SCAM_TIMEOUT_MINUTES, SCAM_IMAGE_MATCH_DISTANCE and SPAM_REPEAT_CHANNELS "
-                "must be integers."
+                "SCAM_TIMEOUT_MINUTES, SCAM_IMAGE_MATCH_DISTANCE, SPAM_REPEAT_CHANNELS and "
+                "GOOGLE_VISION_MONTHLY_LIMIT must be integers."
             ) from exc
         if not 1 <= timeout_minutes <= MAX_TIMEOUT_MINUTES:
             raise ValueError(f"SCAM_TIMEOUT_MINUTES must be 1-{MAX_TIMEOUT_MINUTES}.")
@@ -132,6 +136,8 @@ class Settings:
             raise ValueError("SCAM_IMAGE_MATCH_DISTANCE must be 0-100.")
         if repeat_channels == 1 or repeat_channels < 0:
             raise ValueError("SPAM_REPEAT_CHANNELS must be 0 (off) or at least 2.")
+        if vision_limit < 0:
+            raise ValueError("GOOGLE_VISION_MONTHLY_LIMIT must be 0 (no limit) or more.")
         domains = env.get("BLOCKED_DOMAINS")
         blocked = (
             scam_filter.DEFAULT_BLOCKED_DOMAINS
@@ -154,7 +160,8 @@ class Settings:
             scam_images_dir=resolve(env.get("SCAM_IMAGES_DIR") or "scam-images"),
             repeat_channels=repeat_channels,
             data_dir=resolve(env.get("DATA_DIR") or "data"),
-            ocr_api_key=env.get("OCR_SPACE_API_KEY", "").strip(),
+            vision_api_key=env.get("GOOGLE_VISION_API_KEY", "").strip(),
+            vision_monthly_limit=vision_limit,
             scam_words=scam_words,
         )
 
@@ -398,7 +405,13 @@ class ModeratorBot(discord.Client):
         self.repeats = scam_filter.RepeatTracker(settings.repeat_channels)
         # Reads text in images to find scam words and blocked links; off without a key.
         self.text_reader = (
-            scam_filter.OcrSpaceReader(settings.ocr_api_key) if settings.ocr_api_key else None
+            scam_filter.GoogleVisionReader(
+                settings.vision_api_key,
+                settings.data_dir / "vision_usage.json",
+                settings.vision_monthly_limit,
+            )
+            if settings.vision_api_key
+            else None
         )
         # Messages this bot deleted; they get a scam log instead of a deletion log.
         self.removed_ids: set[int] = set()
@@ -457,7 +470,7 @@ class ModeratorBot(discord.Client):
         # Problems here are logged, not fatal: admins fix them with /logchannel set.
         log.info("Logged in as %s in %s server(s)", self.user, len(self.guilds))
         if self.text_reader is None:
-            log.info("Text in images is not read; set OCR_SPACE_API_KEY to turn it on.")
+            log.info("Text in images is not read; set GOOGLE_VISION_API_KEY to turn it on.")
         active = 0
         for guild in self.guilds:
             channel_id = self.store.channels.get(guild.id)

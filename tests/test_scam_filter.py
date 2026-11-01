@@ -1,3 +1,4 @@
+import base64
 import io
 import random
 import tempfile
@@ -96,66 +97,81 @@ class ScamWordTests(unittest.TestCase):
         self.assertIsNone(sf.ocr_jpeg(b"not an image"))
 
 
-class OcrSpaceReaderTests(unittest.IsolatedAsyncioTestCase):
+class GoogleVisionReaderTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.replies = []
         self.requests = []
 
         async def handler(request):
-            form = await request.post()
-            self.requests.append((request.headers.get("apikey"), form["OCREngine"]))
-            status, body = self.replies.pop(0)
-            return web.json_response(body, status=status)
+            body = await request.json()
+            image = body["requests"][0]
+            self.requests.append(
+                (request.headers.get("X-Goog-Api-Key"), image["features"][0]["type"])
+            )
+            self.assertTrue(base64.b64decode(image["image"]["content"]).startswith(b"\xff\xd8"))
+            status, reply = self.replies.pop(0)
+            return web.json_response(reply, status=status)
 
         app = web.Application()
-        app.router.add_post("/parse/image", handler)
+        app.router.add_post("/v1/images:annotate", handler)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
         await site.start()
         port = self.runner.addresses[0][1]
-        self.reader = sf.OcrSpaceReader("key", url=f"http://127.0.0.1:{port}/parse/image")
+        self.url = f"http://127.0.0.1:{port}/v1/images:annotate"
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.usage_path = Path(self.temp.name) / "vision_usage.json"
+        self.reader = self.make_reader()
         retry_wait = patch.object(sf, "OCR_RETRY_SECONDS", 0)
         retry_wait.start()
         self.addCleanup(retry_wait.stop)
         self.image = encode(sample_image(1))
+
+    def make_reader(self, limit=1000):
+        return sf.GoogleVisionReader("key", self.usage_path, limit, url=self.url)
 
     async def asyncTearDown(self):
         await self.reader.close()
         await self.runner.cleanup()
 
     @staticmethod
-    def ok(*texts):
-        return 200, {
-            "IsErroredOnProcessing": False,
-            "ParsedResults": [{"ParsedText": text} for text in texts],
-        }
+    def ok(text):
+        return 200, {"responses": [{"fullTextAnnotation": {"text": text}}]}
 
     async def test_reads_text_and_remembers_it_by_fingerprint(self):
-        self.replies.append(self.ok("MrBeast", "casino"))
+        self.replies.append(self.ok("MrBeast\ncasino"))
         self.assertEqual(await self.reader.read(self.image, 1), "MrBeast\ncasino")
         self.assertEqual(await self.reader.read(self.image, 1), "MrBeast\ncasino")
-        self.assertEqual(self.requests, [("key", "2")])
+        self.assertEqual(self.requests, [("key", "TEXT_DETECTION")])
+
+    async def test_image_without_text_reads_as_empty(self):
+        self.replies.append((200, {"responses": [{}]}))
+        self.assertEqual(await self.reader.read(self.image, 1), "")
 
     async def test_one_failure_is_retried(self):
-        self.replies += [(503, {}), self.ok("casino")]
+        self.replies += [(503, {"error": {"message": "unavailable"}}), self.ok("casino")]
         with self.assertLogs("scam_filter", level="WARNING") as logs:
             self.assertEqual(await self.reader.read(self.image, 1), "casino")
-        self.assertEqual(logs.output, ["WARNING:scam_filter:OCR.space request failed: HTTP 503"])
+        self.assertEqual(
+            logs.output, ["WARNING:scam_filter:Google Vision request failed: HTTP 503: unavailable"]
+        )
 
     async def test_two_failures_pause_reading(self):
-        quota = (200, "You may only perform this action upto maximum 500 times")
-        self.replies += [quota, quota]
+        denied = (403, {"error": {"message": "API key not valid"}})
+        self.replies += [denied, denied]
         with self.assertLogs("scam_filter", level="WARNING") as logs:
             self.assertIsNone(await self.reader.read(self.image, 1))
-        self.assertIn("500 times", logs.output[0])
+        self.assertIn("API key not valid", logs.output[0])
         self.assertIn("pausing for 5 minutes", logs.output[-1])
         self.assertIsNone(await self.reader.read(self.image, 2))  # paused: no request
         self.assertEqual(len(self.requests), 2)
 
         for reply in (
-            (200, {"IsErroredOnProcessing": True, "ErrorMessage": ["File too large"]}),
-            (403, {}),
+            (200, {"responses": [{"error": {"code": 3, "message": "Bad image data."}}]}),
+            (200, "not json at all"),
+            (500, {}),
         ):
             self.reader.paused_until = time.monotonic() - 1
             self.replies += [reply, reply]
@@ -164,6 +180,41 @@ class OcrSpaceReaderTests(unittest.IsolatedAsyncioTestCase):
         self.reader.paused_until = time.monotonic() - 1
         self.replies.append(self.ok("fine"))
         self.assertEqual(await self.reader.read(self.image, 3), "fine")
+
+    async def test_monthly_limit_stops_reading_and_survives_restart(self):
+        await self.reader.close()
+        self.reader = self.make_reader(limit=2)
+        self.replies += [self.ok("a"), self.ok("b")]
+        self.assertEqual(await self.reader.read(self.image, 1), "a")
+        self.assertEqual(await self.reader.read(self.image, 2), "b")
+        with self.assertLogs("scam_filter", level="WARNING") as logs:
+            self.assertIsNone(await self.reader.read(self.image, 3))
+            self.assertIsNone(await self.reader.read(self.image, 4))
+        self.assertEqual(len(logs.output), 1)  # warned once, not per image
+        self.assertIn("GOOGLE_VISION_MONTHLY_LIMIT", logs.output[0])
+        self.assertEqual(await self.reader.read(self.image, 1), "a")  # cached still works
+        self.assertEqual(len(self.requests), 2)
+
+        await self.reader.close()
+        self.reader = self.make_reader(limit=2)  # restart keeps the count
+        with self.assertLogs("scam_filter", level="WARNING"):
+            self.assertIsNone(await self.reader.read(self.image, 5))
+        self.assertEqual(len(self.requests), 2)
+
+    def test_usage_resets_each_pacific_month(self):
+        usage = sf.MonthlyUsage(self.usage_path, 1)
+        # 07:00 UTC on 1 December is still 30 November in Pacific time.
+        usage.add(datetime(2026, 12, 1, 7, tzinfo=UTC))
+        self.assertEqual(usage.month, "2026-11")
+        self.assertTrue(usage.used_up(datetime(2026, 12, 1, 7, 30, tzinfo=UTC)))
+        self.assertFalse(usage.used_up(datetime(2026, 12, 1, 9, tzinfo=UTC)))
+        self.assertFalse(sf.MonthlyUsage(None, 0).used_up())  # 0: no limit
+
+    def test_unreadable_usage_file_starts_from_zero(self):
+        self.usage_path.write_text("{broken", "utf-8")
+        with self.assertLogs("scam_filter", level="WARNING"):
+            usage = sf.MonthlyUsage(self.usage_path, 5)
+        self.assertEqual(usage.count, 0)
 
     async def test_unreadable_image_is_not_sent(self):
         self.assertIsNone(await self.reader.read(b"broken", 1))

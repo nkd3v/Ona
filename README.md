@@ -19,7 +19,7 @@ A Python bot for Discord servers that:
 - posts a note when someone joins or leaves the server, each in a channel you
   choose. See [Join and leave logs](#join-and-leave-logs).
 - adds `/timeout` for any length, from minutes to years or permanent, beyond
-  Discord's 28-day limit. See [Long and permanent timeouts](#long-and-permanent-timeouts).
+  Discord's 28-day limit, and `/timeouts` to list who is timed out. See [Long and permanent timeouts](#long-and-permanent-timeouts).
 
 ## Setup
 
@@ -283,10 +283,15 @@ Discord's own timeout stops at 28 days. These commands go further:
 | --- | --- |
 | `/timeout member: duration: reason:` | Time out a member. `duration` is free text with suggestions: `30m`, `2h`, `3d`, `2w`, `1d 12h`, `6 months`, `1 year` (up to 10 years) or `permanent` |
 | `/untimeout member:` | End a member's timeout, including a permanent one |
+| `/timeouts` | List who is timed out and when each timeout ends, soonest first. Members who left during a long timeout are listed separately, since it returns if they rejoin |
 
 Only members with **Timeout Members** see them, and, as in Discord, you can only time
 out members whose highest role is below yours and the bot's. Administrators and the
 server owner cannot be timed out. Each use is logged in the log channel.
+
+`/timeouts` lists everyone only with **Server Members Intent** on. Without it the bot
+only knows members who posted since it started, plus the long timeouts it renews, and
+the list says so.
 
 Timeouts of up to 28 days are set once. For longer or permanent ones the bot sets a
 block of just under 28 days, saves it in `data/long_timeouts.json`, and checks every

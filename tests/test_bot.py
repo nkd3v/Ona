@@ -1024,7 +1024,7 @@ class TimeoutCommandTests(unittest.IsolatedAsyncioTestCase):
         return answer_text(self, action)
 
     def test_only_moderators_see_the_commands(self):
-        for name in ("timeout", "untimeout"):
+        for name in ("timeout", "untimeout", "timeouts"):
             data = self.bot.tree.get_command(name).to_dict(self.bot.tree)
             self.assertEqual(int(data["default_member_permissions"]), 1 << 40)
 
@@ -1056,6 +1056,60 @@ class TimeoutCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("timed out for 2 hours 30 minutes", answer)
         self.assertNotIn("renew", answer)
         self.assertEqual(target.timeout.await_args.args[0], timedelta(minutes=150))
+
+    def listing(self, members, chunked=True):
+        action = mod_interaction()
+        action.client = self.bot
+        action.guild.id = 1
+        action.guild.members = members
+        action.guild.chunked = chunked
+        action.guild.get_member = lambda i: next((m for m in members if m.id == i), None)
+        return action
+
+    async def list_timeouts(self, action):
+        await self.bot.tree.get_command("timeouts").callback(action)
+        answer_text(self, action)
+        return action.response.send_message.await_args.kwargs.get("embed")
+
+    async def test_lists_timed_out_members(self):
+        now = datetime.now(UTC)
+        soon = timed_member(42, until=now + timedelta(hours=2))
+        later = timed_member(43, until=now + timedelta(days=3))
+        ended = timed_member(44, until=now - timedelta(minutes=1))
+        free = timed_member(45)
+        # A permanent timeout the bot renews, whose current block ends in 20 days.
+        forever = timed_member(46, until=now + timedelta(days=20))
+        self.bot.long_timeouts.set((1, 46), LongTimeout(None, forever.timed_out_until))
+        # One a moderator removed, and one for someone who left.
+        self.bot.long_timeouts.set((1, 45), LongTimeout(None, now + timedelta(days=9)))
+        self.bot.long_timeouts.set((1, 47), LongTimeout(None, now, left=True))
+        self.bot.long_timeouts.set((2, 48), LongTimeout(None, now + timedelta(days=9)))
+        action = self.listing([later, soon, ended, free, forever])
+
+        embed = await self.list_timeouts(action)
+
+        self.assertEqual(embed.title, "Timed-out members (3)")
+        lines = embed.description.splitlines()
+        self.assertEqual([line.split(">")[0] for line in lines], ["<@42", "<@43", "<@46"])
+        self.assertIn(f"<t:{int(soon.timed_out_until.timestamp())}:R>", lines[0])
+        self.assertTrue(lines[2].endswith("permanent"))
+        self.assertIn("<@47>", embed.fields[0].value)
+        self.assertIsNone(embed.footer.text)
+
+    async def test_no_timeouts_and_partial_member_list(self):
+        action = self.listing([timed_member(42)])
+        self.assertEqual(await self.list_timeouts(action), None)
+        self.assertEqual(answer_text(self, action), "No one is timed out.")
+
+        action = self.listing([timed_member(42, until=datetime.now(UTC) + timedelta(hours=1))])
+        action.guild.chunked = False
+        embed = await self.list_timeouts(action)
+        self.assertIn("Server Members Intent", embed.footer.text)
+
+    def test_long_lists_are_cut_short(self):
+        text = bot_module.fit_lines([f"line {i}" for i in range(100)], 60)
+        self.assertLessEqual(len(text), 60)
+        self.assertTrue(text.endswith("more"))
 
     async def test_refusals(self):
         target = timed_member()

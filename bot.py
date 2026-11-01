@@ -477,6 +477,7 @@ class ModeratorBot(discord.Client):
         self.tree.add_command(MemberLogCommands(self))
         self.tree.add_command(timeout_command)
         self.tree.add_command(untimeout_command)
+        self.tree.add_command(timeouts_command)
 
     async def setup_hook(self) -> None:
         try:
@@ -1387,6 +1388,97 @@ async def untimeout_command(interaction: discord.Interaction, member: discord.Me
     await bot.post_log(member.guild.id, embed)
 
 
+def timed_out_members(
+    bot: ModeratorBot, guild: discord.Guild, now: datetime
+) -> tuple[list[tuple[int, discord.Member | None, datetime | None]], list[int]]:
+    """Members timed out now, as (ID, member, end or None for permanent), soonest end first.
+
+    Also the IDs of members who left during a long timeout, which returns if they rejoin.
+    """
+    found: dict[int, tuple[discord.Member | None, datetime | None]] = {
+        m.id: (m, m.timed_out_until)
+        for m in guild.members
+        if m.timed_out_until is not None and m.timed_out_until > now
+    }
+    left = []
+    for (guild_id, member_id), entry in bot.long_timeouts.entries.items():
+        if guild_id != guild.id:
+            continue
+        if entry.left:
+            found.pop(member_id, None)
+            left.append(member_id)
+            continue
+        member = guild.get_member(member_id)
+        # A moderator changed or removed it; the hourly check will forget it.
+        if member is not None and not timeout_is_ours(member.timed_out_until, entry, now):
+            continue
+        found[member_id] = (member, entry.until)
+    far_future = datetime.max.replace(tzinfo=UTC)
+    current = sorted(
+        ((member_id, member, end) for member_id, (member, end) in found.items()),
+        key=lambda item: (item[2] or far_future, item[0]),
+    )
+    return current, sorted(left)
+
+
+def timeout_line(member_id: int, member: discord.Member | None, end: datetime | None) -> str:
+    name = f" {discord.utils.escape_markdown(shorten(str(member), 40))}" if member else ""
+    if end is None:
+        when = "permanent"
+    else:
+        stamp = int(end.timestamp())
+        when = f"until <t:{stamp}:f> (<t:{stamp}:R>)"
+    return f"<@{member_id}>{name} (`{member_id}`): {when}"
+
+
+def fit_lines(lines: list[str], limit: int) -> str:
+    """Join as many lines as fit in limit characters, saying how many were left out."""
+    text = ""
+    for i, line in enumerate(lines):
+        more = f"\n…and {len(lines) - i} more"
+        if len(text) + len(line) + 1 + len(more) > limit:
+            return text + more
+        text += ("\n" if text else "") + line
+    return text
+
+
+@app_commands.command(name="timeouts", description="List the members who are timed out")
+@app_commands.guild_only()
+@app_commands.default_permissions(moderate_members=True)
+async def timeouts_command(interaction: discord.Interaction) -> None:
+    bot: ModeratorBot = interaction.client
+    guild = interaction.guild
+    if guild is None:
+        await reply(interaction, "Invite the bot to this server first.")
+        return
+    current, left = timed_out_members(bot, guild, datetime.now(UTC))
+    # Without Server Members Intent the bot only knows members it has seen post.
+    partial = not (bot.intents.members and guild.chunked)
+    note = (
+        "\n\nI can only see members who posted since I started, so short timeouts set "
+        "elsewhere may be missing. Turn on Server Members Intent for a full list."
+        if partial
+        else ""
+    )
+    if not current and not left:
+        await reply(interaction, "No one is timed out." + note)
+        return
+    embed = discord.Embed(
+        title=f"Timed-out members ({len(current)})", colour=discord.Colour.orange()
+    )
+    embed.description = fit_lines([timeout_line(*item) for item in current], 4000) or "None"
+    if left:
+        embed.add_field(
+            name=f"Left during a long timeout ({len(left)})",
+            value=fit_lines([f"<@{i}> (`{i}`)" for i in left], 1000)
+            + "\nTimed out again if they rejoin.",
+            inline=False,
+        )
+    if partial:
+        embed.set_footer(text=note.strip())
+    await reply(interaction, "", embed=embed)
+
+
 class LogChannelCommands(
     app_commands.Group,
     name="logchannel",
@@ -1757,13 +1849,20 @@ async def acknowledge(interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
 
 
-async def reply(interaction: discord.Interaction, text: str) -> None:
+async def reply(
+    interaction: discord.Interaction, text: str, *, embed: discord.Embed | None = None
+) -> None:
     """Answer only the person who ran the command."""
-    mentions = discord.AllowedMentions.none()
+    kwargs: dict[str, object] = {
+        "ephemeral": True,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if embed is not None:
+        kwargs["embed"] = embed
     if interaction.response.is_done():
-        await interaction.followup.send(text, ephemeral=True, allowed_mentions=mentions)
+        await interaction.followup.send(text, **kwargs)
     else:
-        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=mentions)
+        await interaction.response.send_message(text, **kwargs)
 
 
 def message_parts(message: discord.Message) -> tuple[str, list[discord.Attachment]]:

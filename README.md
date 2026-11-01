@@ -101,6 +101,10 @@ Saved settings go in `data/` next to `compose.yaml`, so they survive rebuilds. T
 container restarts by itself after a crash or reboot. To update, copy the new files
 over and run `docker compose up -d --build` again.
 
+`sh deploy.sh` does this for the committed code: it copies it to `root@oci1:/opt/ona`
+(change with `DEPLOY_HOST` and `DEPLOY_DIR`), rebuilds and waits for the bot to log in.
+It leaves the server's `.env` and `data/` alone.
+
 ### Hosting panels
 
 The bot also runs on Pterodactyl-style hosting panels, such as Bot-Hosting.net, that

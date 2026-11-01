@@ -14,6 +14,7 @@ from bot import (
     LogChannelStore,
     LongTimeout,
     LongTimeoutStore,
+    MemberLogStore,
     ModeratorBot,
     Settings,
     Trap,
@@ -1182,3 +1183,284 @@ class EditLogTests(unittest.IsolatedAsyncioTestCase):
             await self.edit(edited("secret before"), edited("secret after"))
         self.assertIn("Could not log edit", captured.output[0])
         self.assertNotIn("secret", captured.output[0])
+
+
+JOIN_CHANNEL, LEAVE_CHANNEL = 700, 701
+
+
+def joined_member(member_id=42, account_age=timedelta(days=400), is_bot=False, roles=()):
+    target = MagicMock(spec=discord.Member)
+    target.id = member_id
+    target.bot = is_bot
+    target.guild = SimpleNamespace(id=1, member_count=120)
+    target.created_at = datetime.now(UTC) - account_age
+    target.joined_at = datetime.now(UTC) - timedelta(days=3)
+    target.display_avatar = SimpleNamespace(url="https://cdn.example/avatar.png")
+    default = SimpleNamespace(mention="@everyone", is_default=lambda: True)
+    target.roles = [default, *roles]
+    target.__str__.return_value = "newbie"
+    return target
+
+
+def role(role_id):
+    return SimpleNamespace(mention=f"<@&{role_id}>", is_default=lambda: False)
+
+
+class MemberLogStoreTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "data" / "member_logs.json"
+
+    def test_saves_and_reloads_join_and_leave_channels(self):
+        store = MemberLogStore(self.path)
+        store.set(1, "join", 100)
+        store.set(1, "leave", 101)
+        store.set(2, "leave", 200)
+        self.assertEqual(
+            MemberLogStore(self.path).channels, {1: {"join": 100, "leave": 101}, 2: {"leave": 200}}
+        )
+        store.set(1, "join", None)
+        store.set(2, "leave", None)
+        self.assertEqual(MemberLogStore(self.path).channels, {1: {"leave": 101}})
+
+    def test_unreadable_file_is_reported(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("[1, 2]")
+        with self.assertRaises(ValueError):
+            MemberLogStore(self.path)
+
+
+class MemberLogTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.bot, _ = make_bot(self, AsyncMock(), scam_images_dir=Path("/nonexistent"))
+        self.join = text_channel(AsyncMock(), channel_id=JOIN_CHANNEL)
+        self.leave = text_channel(AsyncMock(), channel_id=LEAVE_CHANNEL)
+        channels = {JOIN_CHANNEL: self.join, LEAVE_CHANNEL: self.leave}
+        self.bot.get_channel = MagicMock(side_effect=channels.get)
+        self.bot.get_guild = MagicMock(return_value=SimpleNamespace(id=1, member_count=119))
+        self.bot.member_logs.set(1, "join", JOIN_CHANNEL)
+        self.bot.member_logs.set(1, "leave", LEAVE_CHANNEL)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def fields(self, embed):
+        return {f.name: f.value for f in embed.fields}
+
+    def test_bot_asks_for_the_members_intent(self):
+        self.assertTrue(self.bot.intents.members)
+        bot = ModeratorBot(
+            Settings("unused", data_dir=self.bot.settings.data_dir), member_events=False
+        )
+        self.assertFalse(bot.intents.members)
+
+    async def test_join_is_posted_in_the_join_channel_without_pings(self):
+        await self.bot.on_member_join(joined_member())
+        self.leave.send.assert_not_awaited()
+        kwargs = self.join.send.await_args.kwargs
+        self.assertEqual(kwargs["allowed_mentions"].to_dict(), {"parse": []})
+        embed = kwargs["embed"]
+        self.assertEqual(embed.title, "Member joined")
+        self.assertIn("<@42> newbie (`42`)", embed.description)
+        self.assertEqual(embed.thumbnail.url, "https://cdn.example/avatar.png")
+        fields = self.fields(embed)
+        self.assertNotIn("New account", fields["Account created"])
+        self.assertEqual(fields["Members"], "120")
+
+    async def test_new_accounts_and_bots_are_pointed_out(self):
+        await self.bot.on_member_join(joined_member(account_age=timedelta(hours=2)))
+        embed = self.join.send.await_args.kwargs["embed"]
+        self.assertIn("New account", self.fields(embed)["Account created"])
+        await self.bot.on_member_join(joined_member(is_bot=True))
+        self.assertEqual(self.join.send.await_args.kwargs["embed"].title, "Bot added")
+
+    async def test_leave_shows_join_date_and_roles_when_known(self):
+        target = joined_member(roles=[role(5), role(6)])
+        await self.bot.on_raw_member_remove(SimpleNamespace(guild_id=1, user=target))
+        self.join.send.assert_not_awaited()
+        embed = self.leave.send.await_args.kwargs["embed"]
+        self.assertEqual(embed.title, "Member left")
+        fields = self.fields(embed)
+        self.assertIn("<t:", fields["Joined"])
+        self.assertEqual(fields["Roles"], "<@&6> <@&5>")  # highest first
+        self.assertEqual(fields["Members"], "119")
+
+    async def test_leave_of_uncached_user_is_still_posted(self):
+        user = MagicMock(spec=discord.User)
+        user.id, user.bot = 7, False
+        user.display_avatar = SimpleNamespace(url="https://cdn.example/u.png")
+        user.__str__.return_value = "someone"
+        await self.bot.on_raw_member_remove(SimpleNamespace(guild_id=1, user=user))
+        embed = self.leave.send.await_args.kwargs["embed"]
+        self.assertIn("<@7> someone", embed.description)
+        self.assertEqual(set(self.fields(embed)), {"Members"})
+
+    async def test_unset_events_and_other_servers_post_nothing(self):
+        self.bot.member_logs.set(1, "leave", None)
+        await self.bot.on_raw_member_remove(SimpleNamespace(guild_id=1, user=joined_member()))
+        other = joined_member()
+        other.guild = SimpleNamespace(id=2, member_count=5)
+        await self.bot.on_member_join(other)
+        self.join.send.assert_not_awaited()
+        self.leave.send.assert_not_awaited()
+
+    async def test_send_failure_is_reported_without_crashing(self):
+        response = SimpleNamespace(status=403, reason="Forbidden")
+        self.join.send.side_effect = discord.Forbidden(response, "Denied")
+        with self.assertLogs("bot", level="ERROR") as captured:
+            await self.bot.on_member_join(joined_member())
+        self.assertIn("member log", captured.output[0])
+
+    async def test_rejoining_member_gets_their_long_timeout_back(self):
+        now = datetime.now(UTC)
+        self.bot.long_timeouts.set(
+            (1, 42), LongTimeout(None, now - timedelta(hours=1), "spam", left=True)
+        )
+        target = timed_member(until=None)
+        target.created_at = now - timedelta(days=400)
+        target.display_avatar = SimpleNamespace(url="https://cdn.example/avatar.png")
+        target.guild = SimpleNamespace(id=1, owner_id=1, member_count=3)
+        await self.bot.on_member_join(target)
+        target.timeout.assert_awaited_once()
+        entry = LongTimeoutStore(self.bot.long_timeouts.path).entries[1, 42]
+        self.assertFalse(entry.left)
+        self.join.send.assert_awaited_once()
+
+
+class MemberLogCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.bot, _ = make_bot(self, AsyncMock())
+        self.channel = text_channel(AsyncMock(), channel_id=JOIN_CHANNEL)
+        self.channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True, send_messages=True, embed_links=True
+        )
+        self.bot.get_channel = MagicMock(
+            side_effect=lambda cid: self.channel if cid == JOIN_CHANNEL else None
+        )
+        self.commands = self.bot.tree.get_command("memberlog")
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def answer(self, action):
+        return answer_text(self, action)
+
+    def saved(self):
+        return MemberLogStore(self.bot.member_logs.path).channels
+
+    async def run_command(self, name, action, *args):
+        await self.commands.get_command(name).callback(self.commands, action, *args)
+
+    def choice(self, value):
+        return next(c for c in bot_module.MEMBER_LOG_CHOICES if c.value == value)
+
+    def test_command_options(self):
+        data = self.commands.to_dict(self.bot.tree)
+        self.assertEqual(int(data["default_member_permissions"]), 32)  # Manage Server
+        self.assertFalse(data["dm_permission"])
+        subcommands = {c["name"]: c for c in data["options"]}
+        self.assertEqual(set(subcommands), {"set", "show", "off"})
+        options = subcommands["set"]["options"]
+        self.assertEqual([o["name"] for o in options], ["event", "channel"])
+        self.assertEqual([c["value"] for c in options[0]["choices"]], ["join", "leave", "both"])
+        self.assertFalse(subcommands["off"]["options"][0].get("required", False))
+
+    async def test_set_join_and_leave_separately_or_together(self):
+        action = interaction()
+        await self.run_command("set", action, self.choice("join"), self.channel)
+        self.assertIn("Joins will be posted in <#700>", self.answer(action))
+        self.channel.send.assert_awaited_once()
+        self.assertEqual(self.saved(), {1: {"join": JOIN_CHANNEL}})
+
+        action = interaction()
+        await self.run_command("set", action, self.choice("both"), self.channel)
+        self.assertEqual(self.saved(), {1: {"join": JOIN_CHANNEL, "leave": JOIN_CHANNEL}})
+
+    async def test_set_refuses_channel_without_permissions(self):
+        self.channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True, send_messages=True, embed_links=False
+        )
+        action = interaction()
+        await self.run_command("set", action, self.choice("join"), self.channel)
+        self.assertIn("embed_links", self.answer(action))
+        self.channel.send.assert_not_awaited()
+        self.assertEqual(self.saved(), {})
+
+    async def test_set_reports_failed_test_post(self):
+        response = SimpleNamespace(status=403, reason="Forbidden")
+        self.channel.send = AsyncMock(side_effect=discord.Forbidden(response, "Denied"))
+        action = interaction()
+        await self.run_command("set", action, self.choice("leave"), self.channel)
+        self.assertIn("HTTP 403", self.answer(action))
+        self.assertEqual(self.saved(), {})
+
+    async def test_set_explains_missing_intent(self):
+        self.bot._connection._intents.members = False
+        action = interaction()
+        await self.run_command("set", action, self.choice("join"), self.channel)
+        self.assertIn("Server Members Intent", self.answer(action))
+        self.assertEqual(self.saved(), {1: {"join": JOIN_CHANNEL}})  # works after a restart
+
+    async def test_show_and_off(self):
+        action = interaction()
+        await self.run_command("show", action)
+        self.assertIn("/memberlog set", self.answer(action))
+
+        self.bot.member_logs.set(1, "join", JOIN_CHANNEL)
+        self.bot.member_logs.set(1, "leave", 555)
+        action = interaction()
+        await self.run_command("show", action)
+        text = self.answer(action)
+        self.assertIn("Joins: <#700>", text)
+        self.assertIn("`555` is gone", text)
+
+        action = interaction()
+        await self.run_command("off", action, self.choice("leave"))
+        self.assertIn("Leaves are no longer posted", self.answer(action))
+        self.assertEqual(self.saved(), {1: {"join": JOIN_CHANNEL}})
+
+        action = interaction()
+        await self.run_command("off", action, None)
+        self.assertEqual(self.saved(), {})
+
+        action = interaction()
+        await self.run_command("off", action, None)
+        self.assertIn("already", self.answer(action))
+
+
+class StartupTests(unittest.TestCase):
+    def test_starts_without_member_logs_when_members_intent_is_off(self):
+        intents = []
+
+        def run(client, token, **kwargs):
+            intents.append(client.intents.members)
+            if client.intents.members:
+                raise discord.PrivilegedIntentsRequired(None)
+
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.dict("os.environ", {"DISCORD_TOKEN": "secret", "DATA_DIR": folder}),
+            patch.object(bot_module, "load_dotenv"),
+            patch("logging.basicConfig"),
+            patch.object(ModeratorBot, "run", run),
+            self.assertLogs("bot", level="WARNING") as captured,
+        ):
+            bot_module.main()
+        self.assertEqual(intents, [True, False])
+        self.assertIn("Server Members Intent", captured.output[0])
+
+    def test_still_stops_when_message_content_intent_is_off(self):
+        def run(client, token, **kwargs):
+            raise discord.PrivilegedIntentsRequired(None)
+
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.dict("os.environ", {"DISCORD_TOKEN": "secret", "DATA_DIR": folder}),
+            patch.object(bot_module, "load_dotenv"),
+            patch("logging.basicConfig"),
+            patch.object(ModeratorBot, "run", run),
+            self.assertLogs("bot", level="WARNING"),
+            self.assertRaises(SystemExit),
+        ):
+            bot_module.main()

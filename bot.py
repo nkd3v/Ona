@@ -1,4 +1,5 @@
-"""Log deleted and edited messages, remove scam posts and run a spam-bot trap channel."""
+"""Log deleted and edited messages and members joining or leaving, remove scam posts and run a
+spam-bot trap channel."""
 
 from __future__ import annotations
 
@@ -61,6 +62,16 @@ DURATION_SUGGESTIONS = (
     "permanent",
 )
 LOG_CHANNEL_PERMISSIONS = ("view_channel", "send_messages", "embed_links", "attach_files")
+# Join and leave announcements: each server picks a channel for each of these.
+MEMBER_LOG_EVENTS = ("join", "leave")
+MEMBER_LOG_PERMISSIONS = ("view_channel", "send_messages", "embed_links")
+MEMBER_LOG_CHOICES = [
+    app_commands.Choice(name="Joins", value="join"),
+    app_commands.Choice(name="Leaves", value="leave"),
+    app_commands.Choice(name="Joins and leaves", value="both"),
+]
+# Join logs point out accounts younger than this, which are often spam bots.
+NEW_ACCOUNT_AGE = timedelta(days=7)
 # The trap channel needs these to post its notice and delete what members post there.
 TRAP_CHANNEL_PERMISSIONS = (
     "view_channel",
@@ -187,6 +198,41 @@ class LogChannelStore:
             channels.pop(guild_id, None)
         else:
             channels[guild_id] = channel_id
+        save_json(self.path, {str(k): v for k, v in channels.items()})
+        self.channels = channels
+
+
+class MemberLogStore:
+    """Each server's join and leave log channels, chosen with /memberlog set."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.channels: dict[int, dict[str, int]] = {}
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            self.channels = {
+                int(guild): {
+                    event: int(channel)
+                    for event, channel in events.items()
+                    if event in MEMBER_LOG_EVENTS
+                }
+                for guild, events in raw.items()
+            }
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Cannot read saved member log channels from {path}: {exc}") from exc
+
+    def set(self, guild_id: int, event: str, channel_id: int | None) -> None:
+        """Save the channel for "join" or "leave", or forget it when channel_id is None."""
+        channels = {guild: dict(events) for guild, events in self.channels.items()}
+        events = channels.setdefault(guild_id, {})
+        if channel_id is None:
+            events.pop(event, None)
+        else:
+            events[event] = channel_id
+        if not events:
+            del channels[guild_id]
         save_json(self.path, {str(k): v for k, v in channels.items()})
         self.channels = channels
 
@@ -384,11 +430,14 @@ RECENT_EDIT = timedelta(minutes=5)
 
 
 class ModeratorBot(discord.Client):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, member_events: bool = True) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         intents.guild_messages = True
         intents.message_content = True
+        # Joins and leaves need Server Members Intent, a privileged intent that main()
+        # turns off when the Developer Portal has not enabled it.
+        intents.members = member_events
         super().__init__(
             intents=intents,
             max_messages=settings.cache_size,
@@ -398,6 +447,7 @@ class ModeratorBot(discord.Client):
         self.store = LogChannelStore(settings.data_dir / "log_channels.json")
         self.traps = TrapStore(settings.data_dir / "trap_channels.json")
         self.long_timeouts = LongTimeoutStore(settings.data_dir / "long_timeouts.json")
+        self.member_logs = MemberLogStore(settings.data_dir / "member_logs.json")
         self.renew_task: asyncio.Task[None] | None = None
         self.known_images = dict(scam_filter.KNOWN_SCAM_IMAGES)
         self.known_images.update(scam_filter.load_image_dir(settings.scam_images_dir))
@@ -424,6 +474,7 @@ class ModeratorBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(LogChannelCommands(self))
         self.tree.add_command(TrapChannelCommands(self))
+        self.tree.add_command(MemberLogCommands(self))
         self.tree.add_command(timeout_command)
         self.tree.add_command(untimeout_command)
 
@@ -447,6 +498,14 @@ class ModeratorBot(discord.Client):
         if guild_id is None or (channel_id := self.store.channels.get(guild_id)) is None:
             return None
         channel = self.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel) and channel.guild.id == guild_id:
+            return channel
+        return None
+
+    def member_log_channel_for(self, guild_id: int, event: str) -> discord.TextChannel | None:
+        """The server's join or leave log channel, if one was set and the bot can see it."""
+        channel_id = self.member_logs.channels.get(guild_id, {}).get(event)
+        channel = self.get_channel(channel_id) if channel_id else None
         if isinstance(channel, discord.TextChannel) and channel.guild.id == guild_id:
             return channel
         return None
@@ -526,6 +585,25 @@ class ModeratorBot(discord.Client):
                         guild.id,
                         ", ".join(dict.fromkeys(missing)),
                     )
+        for guild in self.guilds:
+            for event, channel_id in self.member_logs.channels.get(guild.id, {}).items():
+                channel = self.member_log_channel_for(guild.id, event)
+                if channel is None:
+                    log.warning(
+                        "Server %s (%s): %s log channel %s is gone; run /memberlog set again.",
+                        guild,
+                        guild.id,
+                        event,
+                        channel_id,
+                    )
+                elif not self.intents.members:
+                    log.warning(
+                        "Server %s: %s log is set, but Server Members Intent is off.",
+                        guild.id,
+                        event,
+                    )
+                else:
+                    log.info("Server %s (%s): %s log is #%s", guild, guild.id, event, channel)
         log.info(
             "Scam filter: %s known images, %s blocked domains, action=%s",
             len(self.known_images),
@@ -986,8 +1064,8 @@ class ModeratorBot(discord.Client):
             try:
                 member = await guild.fetch_member(key[1])
             except discord.NotFound:
-                # Without the members intent the bot cannot see them rejoin, so it
-                # renews the timeout if they post again instead.
+                # Renewed when they rejoin, or, without Server Members Intent, when
+                # they post again.
                 self.save_long_timeout(key, replace(entry, left=True))
                 continue
             except discord.HTTPException as exc:
@@ -1051,6 +1129,65 @@ class ModeratorBot(discord.Client):
                 return False
         await self.delete_messages([message], "Posted while under a long timeout")
         return True
+
+    # Members joining and leaving
+
+    async def on_member_join(self, member: discord.Member) -> None:
+        key = (member.guild.id, member.id)
+        if (entry := self.long_timeouts.entries.get(key)) is not None and self.claim(
+            self.reapplied, key
+        ):
+            # Someone under a long timeout rejoined: renew it before they can post.
+            if not await self.renew_timeout(member, entry):
+                self.reapplied.pop(key, None)
+        channel = self.member_log_channel_for(member.guild.id, "join")
+        if channel is None:
+            return
+        now = datetime.now(UTC)
+        embed = discord.Embed(
+            title="Bot added" if member.bot else "Member joined",
+            description=f"<@{member.id}> {shorten(str(member), 200)} (`{member.id}`)",
+            colour=discord.Colour.green(),
+            timestamp=now,
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        created = discord.utils.format_dt(member.created_at, "R")
+        if now - member.created_at < NEW_ACCOUNT_AGE:
+            created = f"**New account**, created {created}"
+        embed.add_field(name="Account created", value=created)
+        if member.guild.member_count:
+            embed.add_field(name="Members", value=f"{member.guild.member_count:,}")
+        await self.send_member_log(channel, embed)
+
+    async def on_raw_member_remove(self, payload: discord.RawMemberRemoveEvent) -> None:
+        channel = self.member_log_channel_for(payload.guild_id, "leave")
+        if channel is None:
+            return
+        user = payload.user
+        embed = discord.Embed(
+            title="Bot removed" if user.bot else "Member left",
+            description=f"<@{user.id}> {shorten(str(user), 200)} (`{user.id}`)",
+            colour=discord.Colour.orange(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        # Join date and roles are known only if the member was in the bot's cache.
+        if isinstance(user, discord.Member):
+            if user.joined_at is not None:
+                embed.add_field(name="Joined", value=discord.utils.format_dt(user.joined_at, "R"))
+            roles = [role.mention for role in reversed(user.roles) if not role.is_default()]
+            if roles:
+                embed.add_field(name="Roles", value=shorten(" ".join(roles), 1000), inline=False)
+        guild = self.get_guild(payload.guild_id)
+        if guild is not None and guild.member_count:
+            embed.add_field(name="Members", value=f"{guild.member_count:,}")
+        await self.send_member_log(channel, embed)
+
+    async def send_member_log(self, channel: discord.TextChannel, embed: discord.Embed) -> None:
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.exception("Could not post a member log in channel %s", channel.id)
 
     async def post_log(self, guild_id: int, embed: discord.Embed) -> None:
         channel = self.log_channel_for(guild_id)
@@ -1473,6 +1610,111 @@ class TrapChannelCommands(
         await delete_notice(self.bot, trap)
 
 
+class MemberLogCommands(
+    app_commands.Group,
+    name="memberlog",
+    description="Announce members joining and leaving this server",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+):
+    def __init__(self, bot: ModeratorBot) -> None:
+        super().__init__()
+        self.bot = bot
+
+    @app_commands.command(name="set", description="Choose where joins or leaves are announced")
+    @app_commands.describe(event="Which to announce in this channel", channel="Where to post them")
+    @app_commands.choices(event=MEMBER_LOG_CHOICES)
+    async def set_channel(
+        self,
+        interaction: discord.Interaction,
+        event: app_commands.Choice[str],
+        channel: discord.TextChannel,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None or guild.me is None:
+            await reply(interaction, "Invite the bot to this server first.")
+            return
+        missing = missing_permissions(channel.permissions_for(guild.me), MEMBER_LOG_PERMISSIONS)
+        if missing:
+            await reply(
+                interaction,
+                f"I need these permissions in {channel.mention} first: {', '.join(missing)}.",
+            )
+            return
+        events = MEMBER_LOG_EVENTS if event.value == "both" else (event.value,)
+        what = event.name.lower()
+        embed = discord.Embed(
+            title="Member log channel",
+            description=f"{event.name} in this server will be posted here.",
+            colour=discord.Colour.green(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.set_footer(text=f"Set by {shorten(str(interaction.user), 100)}")
+        await acknowledge(interaction)
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as exc:
+            await reply(interaction, f"I could not post in {channel.mention} (HTTP {exc.status}).")
+            return
+        try:
+            for name in events:
+                self.bot.member_logs.set(guild.id, name, channel.id)
+        except OSError:
+            log.exception("Could not save the member log channel for server %s", guild.id)
+            await reply(interaction, "I could not save this setting. Check the bot's console.")
+            return
+        log.info("Server %s (%s): %s log set to %s", guild, guild.id, what, channel.id)
+        text = f"{event.name} will be posted in {channel.mention}."
+        if not self.bot.intents.members:
+            text += (
+                "\nI cannot see members join or leave yet. Turn on **Server Members Intent** "
+                "in the Discord Developer Portal (Bot > Privileged Gateway Intents), then "
+                "restart the bot."
+            )
+        await reply(interaction, text)
+
+    @app_commands.command(name="show", description="Show where joins and leaves are posted")
+    async def show(self, interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id or 0
+        saved = self.bot.member_logs.channels.get(guild_id, {})
+        lines = []
+        for event, label in (("join", "Joins"), ("leave", "Leaves")):
+            if (channel_id := saved.get(event)) is None:
+                lines.append(f"{label}: off")
+            elif self.bot.member_log_channel_for(guild_id, event) is None:
+                lines.append(f"{label}: channel `{channel_id}` is gone or hidden from me")
+            else:
+                lines.append(f"{label}: <#{channel_id}>")
+        if not saved:
+            lines.append("Use `/memberlog set` to choose a channel.")
+        elif not self.bot.intents.members:
+            lines.append("Server Members Intent is off, so nothing is posted.")
+        await reply(interaction, "\n".join(lines))
+
+    @app_commands.command(name="off", description="Stop announcing joins or leaves")
+    @app_commands.describe(event="Which to stop (default: both)")
+    @app_commands.choices(event=MEMBER_LOG_CHOICES)
+    async def off(
+        self, interaction: discord.Interaction, event: app_commands.Choice[str] | None = None
+    ) -> None:
+        guild_id = interaction.guild_id or 0
+        value = event.value if event else "both"
+        events = MEMBER_LOG_EVENTS if value == "both" else (value,)
+        saved = self.bot.member_logs.channels.get(guild_id, {})
+        label = event.name if event else "Joins and leaves"
+        if not any(name in saved for name in events):
+            await reply(interaction, f"{label} are already not posted.")
+            return
+        try:
+            for name in events:
+                self.bot.member_logs.set(guild_id, name, None)
+        except OSError:
+            log.exception("Could not save the member log channel for server %s", guild_id)
+            await reply(interaction, "I could not save this setting. Check the bot's console.")
+            return
+        await reply(interaction, f"{label} are no longer posted.")
+
+
 def trap_notice(trap: Trap) -> discord.ui.LayoutView:
     """The warning posted in the trap channel, with the catch counter inside the same box.
 
@@ -1595,7 +1837,16 @@ def main() -> None:
         log.warning("DISCORD_LOG_CHANNEL_ID is no longer used. Run /logchannel set in your server.")
     try:
         settings = Settings.from_env(os.environ)
-        ModeratorBot(settings).run(settings.token, log_handler=None)
+        try:
+            ModeratorBot(settings).run(settings.token, log_handler=None)
+        except discord.PrivilegedIntentsRequired:
+            # Keep the rest of the bot working when only Server Members Intent is off.
+            # If Message Content Intent is off too, this second start fails as well.
+            log.warning(
+                "Server Members Intent is off in the Discord Developer Portal, so join and "
+                "leave logs are off. Starting without them."
+            )
+            ModeratorBot(settings, member_events=False).run(settings.token, log_handler=None)
     except (ValueError, discord.LoginFailure, discord.PrivilegedIntentsRequired) as exc:
         raise SystemExit(f"Bot startup failed: {exc}") from exc
 

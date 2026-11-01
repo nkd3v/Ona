@@ -16,6 +16,8 @@ A Python bot for Discord servers that:
 - runs a trap channel: anyone who posts in a channel marked "do not send messages
   here" is timed out and their recent messages are deleted. Spam bots post
   everywhere, so they fall for it. See [Trap channel](#trap-channel).
+- posts a note when someone joins or leaves the server, each in a channel you
+  choose. See [Join and leave logs](#join-and-leave-logs).
 - adds `/timeout` for any length, from minutes to years or permanent, beyond
   Discord's 28-day limit. See [Long and permanent timeouts](#long-and-permanent-timeouts).
 
@@ -23,8 +25,9 @@ A Python bot for Discord servers that:
 
 1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
 2. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
-   In **Bot**, obtain a bot token and enable **Message Content Intent** under
-   **Privileged Gateway Intents**. Keep the token private.
+   In **Bot**, obtain a bot token and enable **Message Content Intent** and
+   **Server Members Intent** under **Privileged Gateway Intents**. Keep the token
+   private. Server Members Intent is only needed for join and leave logs.
 3. Use **OAuth2 → URL Generator** with the `bot` and `applications.commands` scopes to
    invite it to your server.
    Give it **View Channels**, **Send Messages**, **Embed Links**, **Read Message History**,
@@ -51,6 +54,7 @@ A Python bot for Discord servers that:
 5. In your server, run `/logchannel set` and pick a private moderator channel.
    See [Choosing the log channel](#choosing-the-log-channel).
 6. Optionally, run `/trapchannel set` to catch spam bots. See [Trap channel](#trap-channel).
+   Run `/memberlog set` to post joins and leaves. See [Join and leave logs](#join-and-leave-logs).
 7. Send a message in another channel the bot can view, then delete it. Check the
    moderator log channel for an embed and transcript. Try a bulk purge too, and edit
    a message to see an edit log.
@@ -99,6 +103,8 @@ offer a Python server:
 
 The bot stops at startup only if `DISCORD_TOKEN` is missing or wrong, or if
 **Message Content Intent** is off in the Developer Portal. The console says which.
+If only **Server Members Intent** is off, the bot logs a warning and starts without
+join and leave logs.
 
 ## Scam filter
 
@@ -224,6 +230,35 @@ Discord has no way to delete one person's messages short of banning them, so the
 deletes the messages it has in its memory (see below). Messages sent before the bot
 last started, or older than its cache, are not deleted.
 
+## Join and leave logs
+
+The bot can post a note each time someone joins or leaves the server. Joins and
+leaves each have their own channel, which can be the same channel, a public welcome
+channel, or the moderator log channel.
+
+| Command | What it does |
+| --- | --- |
+| `/memberlog set event: channel:` | Post `Joins`, `Leaves`, or `Joins and leaves` in that channel |
+| `/memberlog show` | Show the join and leave channels |
+| `/memberlog off event:` | Stop posting joins, leaves, or both (the default) |
+
+A join note shows the member, their ID and avatar, when the account was created, and
+the new member count. Accounts less than 7 days old are marked **New account**, since
+spam bots often use fresh accounts. A leave note shows the member and the new member
+count, plus when they joined and their roles if the bot saw them since it last started.
+Kicks and bans also show up as leaves. Bots are shown as "Bot added" and "Bot
+removed". Mentions in these notes never notify anyone.
+
+Like the other setup commands, only members with **Manage Server** see these. The bot
+needs **View Channel**, **Send Messages** and **Embed Links** in each channel
+(`/memberlog set` checks this and posts a confirmation there). Choices are saved in
+`data/member_logs.json`.
+
+Discord only tells the bot about joins and leaves when **Server Members Intent** is on
+in the [Developer Portal](https://discord.com/developers/applications) (**Bot →
+Privileged Gateway Intents**). If it is off, `/memberlog set` still saves your choice
+and says to turn the intent on, then restart the bot.
+
 ## Long and permanent timeouts
 
 Discord's own timeout stops at 28 days. These commands go further:
@@ -251,8 +286,9 @@ The bot stops renewing when:
   channel gets a "Long timeout stopped" note.
 
 A timeout survives leaving and rejoining the server until its current block ends.
-The bot cannot see members join (that needs a privileged intent), so if a member
-rejoins after that and posts, the bot deletes the post and times them out again.
+If a member rejoins after that, the bot times them out again as they join. With
+**Server Members Intent** off it cannot see joins, so it deletes their first post
+and times them out again then.
 For someone who should never come back, a ban is still the better tool.
 
 ## Edited messages

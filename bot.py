@@ -472,6 +472,28 @@ def edit_transcript(before: discord.Message | None, after: discord.Message) -> s
     return "\n".join(lines) + "\n"
 
 
+@dataclass(frozen=True)
+class PostState:
+    """The parts of a forum post that live on the post itself, not in its messages."""
+
+    title: str
+    tags: tuple[int, ...]
+
+    @classmethod
+    def of(cls, thread: discord.Thread) -> PostState:
+        return cls(thread.name, tuple(thread._applied_tags))
+
+
+def tag_names(forum: discord.ForumChannel | None, tags: tuple[int, ...]) -> str:
+    if not tags:
+        return "[No tags]"
+    names = []
+    for tag_id in tags:
+        tag = forum.get_tag(tag_id) if forum is not None else None
+        names.append(tag.name if tag is not None else f"Unknown tag {tag_id}")
+    return ", ".join(names)
+
+
 # A real edit stamps the message with the edit time. Other updates, such as a link
 # preview loading or a pin, repeat the old stamp, so an old stamp means no new edit.
 RECENT_EDIT = timedelta(minutes=5)
@@ -523,6 +545,9 @@ class ModeratorBot(discord.Client):
         self.trapped: dict[tuple[int, int], datetime] = {}
         # (server ID, member ID) -> when a lapsed long timeout was set again.
         self.reapplied: dict[tuple[int, int], datetime] = {}
+        # Forum post ID -> title and tags. Discord drops archived posts from the cache,
+        # so this keeps them to compare with when a post is reopened by an edit.
+        self.archived_posts: dict[int, PostState] = {}
         self.tree = CommandTree(self)
         self.tree.add_command(LogChannelCommands(self))
         self.tree.add_command(TrapChannelCommands(self))
@@ -842,16 +867,17 @@ class ModeratorBot(discord.Client):
         if channel is None or channel_id == channel.id:
             return
 
+        first_id = next(iter(message_ids))
         embed = discord.Embed(
-            title="Message deleted"
+            title=f"{self.message_kind(channel_id, first_id)} deleted"
             if len(message_ids) == 1
             else f"{len(message_ids)} messages deleted",
             colour=discord.Colour.orange(),
             timestamp=datetime.now(UTC),
         )
-        embed.add_field(name="Channel", value=f"<#{channel_id}> (`{channel_id}`)", inline=False)
+        embed.add_field(name="Channel", value=self.channel_text(channel_id), inline=False)
         if len(message_ids) == 1:
-            message_id = next(iter(message_ids))
+            message_id = first_id
             message = cached.get(message_id)
             embed.set_footer(text=f"Message ID: {message_id} • Deletion actor unknown")
             if message is not None:
@@ -914,14 +940,12 @@ class ModeratorBot(discord.Client):
 
         author = after.author
         embed = discord.Embed(
-            title="Message edited",
+            title=f"{self.message_kind(after.channel.id, after.id)} edited",
             description=f"[Jump to message]({after.jump_url})",
             colour=discord.Colour.blue(),
             timestamp=datetime.now(UTC),
         )
-        embed.add_field(
-            name="Channel", value=f"<#{after.channel.id}> (`{after.channel.id}`)", inline=False
-        )
+        embed.add_field(name="Channel", value=self.channel_text(after.channel.id), inline=False)
         embed.add_field(
             name="Author",
             value=f"<@{author.id}> {shorten(str(author), 200)} (`{author.id}`)",
@@ -956,6 +980,150 @@ class ModeratorBot(discord.Client):
         except discord.HTTPException:
             # Do not print potentially sensitive message contents to application logs.
             log.exception("Could not log edit of message %s", after.id)
+
+    # Forum posts. A post is a thread in a forum channel; its first message has the
+    # thread's ID and the rest are comments. Message events cover editing or deleting
+    # those messages, but deleting a whole post and changing its title or tags are
+    # thread events.
+
+    def forum_post(self, channel_id: int) -> discord.Thread | None:
+        """The cached forum post with this ID, if it is one."""
+        thread = self.get_channel(channel_id)
+        if isinstance(thread, discord.Thread) and isinstance(thread.parent, discord.ForumChannel):
+            return thread
+        return None
+
+    def message_kind(self, channel_id: int, message_id: int) -> str:
+        if self.forum_post(channel_id) is None:
+            return "Message"
+        return "Forum post" if message_id == channel_id else "Forum comment"
+
+    def channel_text(self, channel_id: int) -> str:
+        text = f"<#{channel_id}> (`{channel_id}`)"
+        if (post := self.forum_post(channel_id)) is not None:
+            text += f" in forum <#{post.parent_id}>"
+        return text
+
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        self.archived_posts.pop(payload.thread_id, None)
+        if not self.is_allowed(payload.guild_id):
+            return
+        forum = self.get_channel(payload.parent_id)
+        if not isinstance(forum, discord.ForumChannel):
+            return
+        channel = self.log_channel_for(payload.guild_id)
+        if channel is None:
+            return
+
+        post_id, thread = payload.thread_id, payload.thread
+        # Deleting a post sends no message deletions, so save whatever is cached.
+        cached = {m.id: m for m in self.cached_messages if m.channel.id == post_id}
+        starter = cached.get(post_id)
+        owner_id = thread.owner_id if thread is not None else starter and starter.author.id
+        embed = discord.Embed(
+            title="Forum post deleted",
+            description=shorten(thread.name, 256)
+            if thread is not None
+            else "Title unavailable: the post was not in my cache.",
+            colour=discord.Colour.orange(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.add_field(name="Forum", value=f"<#{forum.id}> (`{forum.id}`)", inline=False)
+        if owner_id is not None:
+            embed.add_field(name="Author", value=f"<@{owner_id}> (`{owner_id}`)", inline=False)
+        if thread is not None and thread._applied_tags:
+            embed.add_field(
+                name="Tags", value=shorten(tag_names(forum, PostState.of(thread).tags), 1024)
+            )
+        embed.add_field(
+            name="Opening message",
+            value=shorten(starter.content or "[No text content]", 1024)
+            if starter is not None
+            else "Unavailable: it was not in my cache.",
+            inline=False,
+        )
+        comments = len(cached) - (starter is not None)
+        embed.add_field(name="Comments in my cache", value=str(comments))
+        embed.set_footer(text=f"Post ID: {post_id} • Deletion actor unknown")
+
+        lines = [
+            "Deleted forum post",
+            f"Title: {thread.name if thread is not None else 'unavailable'}",
+            f"Forum: #{forum.name} (ID: {forum.id})",
+            f"Author ID: {owner_id if owner_id is not None else 'unknown'}",
+            "Comments that were not in the bot's cache are not listed.",
+            "",
+        ]
+        ids = set(cached) | {post_id}
+        data = ("\n".join(lines) + transcript(payload.guild_id, post_id, ids, cached)).encode()
+        try:
+            with closing(discord.File(io.BytesIO(data), filename=f"post-{post_id}.txt")) as file:
+                await channel.send(
+                    embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none()
+                )
+        except discord.HTTPException:
+            log.exception("Could not log deletion of forum post %s", post_id)
+
+    async def on_thread_update(self, before: discord.Thread, after: discord.Thread) -> None:
+        if not isinstance(after.parent, discord.ForumChannel):
+            return
+        if after.archived:
+            self.archived_posts[after.id] = PostState.of(after)
+        await self.log_post_edit(after, PostState.of(before), PostState.of(after))
+
+    async def on_raw_thread_update(self, payload: discord.RawThreadUpdateEvent) -> None:
+        # Cached posts go to on_thread_update. An archived post is not cached, so
+        # compare with what it was when it was archived.
+        if (
+            payload.thread is not None
+            or (before := self.archived_posts.get(payload.thread_id)) is None
+        ):
+            return
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        after = discord.Thread(guild=guild, state=self._connection, data=payload.data)
+        if not after.archived:
+            del self.archived_posts[after.id]
+        else:
+            self.archived_posts[after.id] = PostState.of(after)
+        await self.log_post_edit(after, before, PostState.of(after))
+
+    async def log_post_edit(
+        self, post: discord.Thread, before: PostState, after: PostState
+    ) -> None:
+        """Log a change to a forum post's title or tags."""
+        if before == after or not self.is_allowed(post.guild.id):
+            return
+        channel = self.log_channel_for(post.guild.id)
+        if channel is None:
+            return
+        forum = post.parent if isinstance(post.parent, discord.ForumChannel) else None
+        embed = discord.Embed(
+            title="Forum post edited",
+            description=f"[Jump to post]({post.jump_url})",
+            colour=discord.Colour.blue(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.add_field(name="Post", value=self.channel_text(post.id), inline=False)
+        embed.add_field(
+            name="Author", value=f"<@{post.owner_id}> (`{post.owner_id}`)", inline=False
+        )
+        if before.title != after.title:
+            embed.add_field(name="Title before", value=shorten(before.title, 1024), inline=False)
+            embed.add_field(name="Title after", value=shorten(after.title, 1024), inline=False)
+        if before.tags != after.tags:
+            embed.add_field(
+                name="Tags before", value=shorten(tag_names(forum, before.tags), 1024), inline=False
+            )
+            embed.add_field(
+                name="Tags after", value=shorten(tag_names(forum, after.tags), 1024), inline=False
+            )
+        embed.set_footer(text=f"Post ID: {post.id} • Editor unknown")
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.exception("Could not log edit of forum post %s", post.id)
 
     # Scam filter
 

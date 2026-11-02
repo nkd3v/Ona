@@ -9,6 +9,8 @@ A Python bot for Discord servers that:
 - posts edited-message logs into the same channel, showing the text before and after
   the edit, any attachments removed, and a link to the message. See
   [Edited messages](#edited-messages).
+- logs forum posts and comments that are edited or deleted, including a whole post
+  being deleted and a post's title or tags changing. See [Forum posts](#forum-posts).
 - automatically deletes scam posts, such as the "MrBeast crypto casino" (wispwin.com,
   fapwin.com) images posted by hacked accounts, and times out the poster. It can also
   read the text in images to catch new versions of the scam. See
@@ -369,6 +371,22 @@ The old text comes from the bot's message cache (see below). For a message that 
 not in the cache, the log shows only the new text. Edits by bots, including this
 one, and edits inside the log channel are not logged. Updates that do not change the
 text or files, such as a link preview loading or a message being pinned, are ignored.
+
+## Forum posts
+
+Forum posts and their comments get the same edit and deletion logs as other
+messages, titled "Forum post edited", "Forum comment deleted" and so on, with the
+post and its forum in the **Channel** field.
+
+Deleting a whole post is a separate event. The log channel gets an orange "Forum post
+deleted" embed with the title, forum, author, tags and opening message. The attached
+transcript has the opening message and every comment in the bot's cache.
+
+Changing a post's title or tags posts a blue "Forum post edited" embed with the
+values before and after. Discord does not say who made the change or who deleted a
+post. Discord stops sending the bot old posts that were closed (archived) for
+inactivity. If such a post is renamed, the change is logged only if the bot saw the
+post close since it last started.
 
 ## What can be recovered?
 

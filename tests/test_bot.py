@@ -1776,3 +1776,180 @@ class CreatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("limit is reached", bot_module.ocr_quota_text(reader))
         reader.usage.limit = 0
         self.assertIn("no monthly limit", bot_module.ocr_quota_text(reader))
+
+
+FORUM, POST = 500, 600
+
+
+def forum_channel():
+    forum = MagicMock(spec=discord.ForumChannel)
+    forum.id = FORUM
+    forum.name = "help"
+    tags = {1: "bug", 2: "solved"}
+    forum.get_tag = lambda tag_id: SimpleNamespace(name=tags[tag_id]) if tag_id in tags else None
+    return forum
+
+
+def post_data(name="Crash on start", tags=(1,), archived=False):
+    return {
+        "id": str(POST),
+        "guild_id": "1",
+        "parent_id": str(FORUM),
+        "owner_id": "42",
+        "name": name,
+        "type": 11,
+        "message_count": 1,
+        "member_count": 1,
+        "applied_tags": [str(tag) for tag in tags],
+        "thread_metadata": {
+            "archived": archived,
+            "auto_archive_duration": 1440,
+            "archive_timestamp": "2026-01-01T00:00:00+00:00",
+        },
+    }
+
+
+class ForumLogTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.sent = []
+
+        async def send(**kwargs):
+            file = kwargs.get("file")
+            self.sent.append(
+                {
+                    "embed": kwargs["embed"],
+                    "text": file.fp.read().decode("utf-8") if file else None,
+                    "mentions": kwargs["allowed_mentions"].to_dict(),
+                }
+            )
+
+        self.bot, self.log = make_bot(self, send)
+        self.forum = forum_channel()
+        self.guild = SimpleNamespace(
+            id=1, get_channel=lambda cid: self.forum if cid == FORUM else None
+        )
+        self.threads = {}
+        channels = {999: self.log, FORUM: self.forum}
+        self.bot.get_channel = MagicMock(
+            side_effect=lambda cid: self.threads.get(cid) or channels.get(cid)
+        )
+        self.bot.get_guild = MagicMock(return_value=self.guild)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def thread(self, **data):
+        return discord.Thread(guild=self.guild, state=self.bot._connection, data=post_data(**data))
+
+    def fields(self, index=0):
+        return {field.name: field.value for field in self.sent[index]["embed"].fields}
+
+    async def test_post_and_comment_edits_and_deletes_are_named(self):
+        self.threads[POST] = self.thread()
+        await self.bot.on_raw_message_edit(
+            SimpleNamespace(
+                cached_message=edited("old", message_id=POST, channel_id=POST),
+                message=edited("new", message_id=POST, channel_id=POST),
+            )
+        )
+        await self.bot.on_raw_message_edit(
+            SimpleNamespace(
+                cached_message=edited("old", message_id=601, channel_id=POST),
+                message=edited("new", message_id=601, channel_id=POST),
+            )
+        )
+        for message_id in (POST, 601):
+            await self.bot.on_raw_message_delete(
+                SimpleNamespace(
+                    guild_id=1, channel_id=POST, message_id=message_id, cached_message=None
+                )
+            )
+        titles = [item["embed"].title for item in self.sent]
+        self.assertEqual(
+            titles,
+            [
+                "Forum post edited",
+                "Forum comment edited",
+                "Forum post deleted",
+                "Forum comment deleted",
+            ],
+        )
+        self.assertIn(f"in forum <#{FORUM}>", self.fields()["Channel"])
+
+    async def test_deleted_post_logs_title_tags_and_cached_messages(self):
+        thread = self.thread()
+        starter = SimpleNamespace(**vars(message(POST, "It crashes @everyone")), channel=thread)
+        comment = SimpleNamespace(**vars(message(601, "Same here")), channel=thread)
+        elsewhere = SimpleNamespace(**vars(message(700, "Other")), channel=SimpleNamespace(id=2))
+        payload = SimpleNamespace(
+            guild_id=1, parent_id=FORUM, thread_id=POST, thread=thread, thread_type=None
+        )
+        with patch.object(
+            ModeratorBot,
+            "cached_messages",
+            new_callable=PropertyMock,
+            return_value=[starter, comment, elsewhere],
+        ):
+            await self.bot.on_raw_thread_delete(payload)
+        self.assertEqual(len(self.sent), 1)
+        embed = self.sent[0]["embed"]
+        self.assertEqual(embed.title, "Forum post deleted")
+        self.assertEqual(embed.description, "Crash on start")
+        fields = self.fields()
+        self.assertEqual(fields["Tags"], "bug")
+        self.assertEqual(fields["Opening message"], "It crashes @everyone")
+        self.assertEqual(fields["Comments in my cache"], "1")
+        self.assertIn("`42`", fields["Author"])
+        self.assertEqual(self.sent[0]["mentions"]["parse"], [])
+        text = self.sent[0]["text"]
+        self.assertIn("Title: Crash on start", text)
+        self.assertIn("Same here", text)
+        self.assertNotIn("Other", text)
+
+    async def test_uncached_post_and_other_threads(self):
+        payload = SimpleNamespace(guild_id=1, parent_id=FORUM, thread_id=POST, thread=None)
+        with patch.object(
+            ModeratorBot, "cached_messages", new_callable=PropertyMock, return_value=[]
+        ):
+            await self.bot.on_raw_thread_delete(payload)
+            # A thread in a text channel, and a post in a server the bot does not work in.
+            await self.bot.on_raw_thread_delete(
+                SimpleNamespace(guild_id=1, parent_id=2, thread_id=POST, thread=None)
+            )
+            await self.bot.on_raw_thread_delete(
+                SimpleNamespace(guild_id=3, parent_id=FORUM, thread_id=POST, thread=None)
+            )
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("unavailable", self.sent[0]["embed"].description)
+        self.assertIn("not in my cache", self.fields()["Opening message"])
+
+    async def test_title_and_tag_changes_are_logged(self):
+        before, after = self.thread(), self.thread(name="Crash on launch", tags=(1, 2))
+        await self.bot.on_thread_update(before, after)
+        fields = self.fields()
+        self.assertEqual(self.sent[0]["embed"].title, "Forum post edited")
+        self.assertEqual(fields["Title before"], "Crash on start")
+        self.assertEqual(fields["Title after"], "Crash on launch")
+        self.assertEqual(fields["Tags before"], "bug")
+        self.assertEqual(fields["Tags after"], "bug, solved")
+        self.assertIn(f"/1/{POST}", self.sent[0]["embed"].description)
+
+    async def test_other_updates_are_ignored(self):
+        # Archiving, locking and the like do not change the title or tags.
+        await self.bot.on_thread_update(self.thread(), self.thread(archived=True))
+        self.bot.servers.set(1, ServerAccess(False, "not allowed", None))
+        await self.bot.on_thread_update(self.thread(), self.thread(name="Other"))
+        self.assertEqual(self.sent, [])
+
+    async def test_archived_post_renamed_while_reopened(self):
+        # Archiving drops the post from discord.py's cache; the bot remembers it.
+        await self.bot.on_thread_update(self.thread(), self.thread(archived=True))
+        payload = SimpleNamespace(
+            guild_id=1, thread_id=POST, thread=None, data=post_data(name="Fixed")
+        )
+        await self.bot.on_raw_thread_update(payload)
+        self.assertEqual(self.fields()["Title after"], "Fixed")
+        self.assertNotIn(POST, self.bot.archived_posts)
+        # A post archived before the bot started has nothing to compare with.
+        await self.bot.on_raw_thread_update(payload)
+        self.assertEqual(len(self.sent), 1)

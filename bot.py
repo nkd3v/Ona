@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
@@ -237,6 +238,53 @@ class MemberLogStore:
         self.channels = channels
 
 
+@dataclass(frozen=True)
+class ServerAccess:
+    """Whether the bot works in a server, and who added it there if known."""
+
+    allowed: bool
+    why: str
+    added_by: int | None = None
+    added_by_name: str = ""
+
+
+class ServerStore:
+    """The servers the bot works in. It works only where its creator added or allowed it."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.servers: dict[int, ServerAccess] = {}
+        # True until the first check after this rule was introduced. The servers the bot
+        # was already in then keep working; the creator can remove them with /servers leave.
+        self.first_run = False
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            self.servers = {int(k): ServerAccess(**v) for k, v in raw.items()}
+        except FileNotFoundError:
+            self.first_run = True
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Cannot read saved servers from {path}: {exc}") from exc
+
+    def set(self, guild_id: int, access: ServerAccess | None) -> None:
+        """Save a server's access, or forget the server when access is None."""
+        servers = dict(self.servers)
+        if access is None:
+            servers.pop(guild_id, None)
+        else:
+            servers[guild_id] = access
+        self.save(servers)
+
+    def save(self, servers: dict[int, ServerAccess] | None = None) -> None:
+        servers = self.servers if servers is None else servers
+        save_json(self.path, {str(k): asdict(v) for k, v in servers.items()})
+        self.servers = servers
+        self.first_run = False
+
+    def allowed(self, guild_id: int | None) -> bool:
+        access = self.servers.get(guild_id) if guild_id is not None else None
+        return access is not None and access.allowed
+
+
 def save_json(path: Path, data: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
@@ -448,6 +496,10 @@ class ModeratorBot(discord.Client):
         self.traps = TrapStore(settings.data_dir / "trap_channels.json")
         self.long_timeouts = LongTimeoutStore(settings.data_dir / "long_timeouts.json")
         self.member_logs = MemberLogStore(settings.data_dir / "member_logs.json")
+        self.servers = ServerStore(settings.data_dir / "servers.json")
+        # The bot's creator: the application's owner, or its team's members.
+        self.owner_ids: frozenset[int] = frozenset()
+        self.bot_public: bool | None = None
         self.renew_task: asyncio.Task[None] | None = None
         self.known_images = dict(scam_filter.KNOWN_SCAM_IMAGES)
         self.known_images.update(scam_filter.load_image_dir(settings.scam_images_dir))
@@ -471,15 +523,18 @@ class ModeratorBot(discord.Client):
         self.trapped: dict[tuple[int, int], datetime] = {}
         # (server ID, member ID) -> when a lapsed long timeout was set again.
         self.reapplied: dict[tuple[int, int], datetime] = {}
-        self.tree = app_commands.CommandTree(self)
+        self.tree = CommandTree(self)
         self.tree.add_command(LogChannelCommands(self))
         self.tree.add_command(TrapChannelCommands(self))
         self.tree.add_command(MemberLogCommands(self))
         self.tree.add_command(timeout_command)
         self.tree.add_command(untimeout_command)
         self.tree.add_command(timeouts_command)
+        self.tree.add_command(ServerCommands(self))
+        self.tree.add_command(ocr_quota_command)
 
     async def setup_hook(self) -> None:
+        await self.load_owners()
         try:
             await self.tree.sync()
         except discord.HTTPException:
@@ -526,9 +581,152 @@ class ModeratorBot(discord.Client):
             return channel
         return None
 
+    async def load_owners(self) -> None:
+        """Find who created the bot, from its application in the Developer Portal."""
+        try:
+            app = await self.application_info()
+        except discord.HTTPException:
+            log.exception("Could not look up the bot's creator; retrying when connected")
+            return
+        if app.team is not None:
+            self.owner_ids = frozenset(member.id for member in app.team.members)
+        else:
+            self.owner_ids = frozenset((app.owner.id,))
+        self.bot_public = app.bot_public
+
+    def is_allowed(self, guild_id: int | None) -> bool:
+        """Whether the bot works in this server: its creator added or allowed it there."""
+        return self.servers.allowed(guild_id)
+
+    async def find_adder(self, guild: discord.Guild) -> discord.abc.User | None:
+        """Who added the bot to the server, if its permissions there let it find out."""
+        permissions = guild.me.guild_permissions if guild.me is not None else None
+        if permissions is None:
+            return None
+        if permissions.manage_guild:
+            try:
+                for integration in await guild.integrations():
+                    if (
+                        isinstance(integration, discord.BotIntegration)
+                        and integration.application.id == self.application_id
+                        and integration.user is not None
+                    ):
+                        return integration.user
+            except discord.HTTPException as exc:
+                log.warning(
+                    "Server %s: could not read integrations (HTTP %s)", guild.id, exc.status
+                )
+        if permissions.view_audit_log and self.user is not None:
+            try:
+                async for entry in guild.audit_logs(
+                    limit=100, action=discord.AuditLogAction.bot_add
+                ):
+                    # Newest first, so this is the latest time the bot was added.
+                    if entry.target is not None and entry.target.id == self.user.id:
+                        return entry.user
+            except discord.HTTPException as exc:
+                log.warning(
+                    "Server %s: could not read the audit log (HTTP %s)", guild.id, exc.status
+                )
+        return None
+
+    async def check_server(self, guild: discord.Guild, *, first_run: bool = False) -> None:
+        """Work in a server only if the creator added or allowed the bot there.
+
+        Leaves a server someone else added it to. When the bot cannot tell who added it,
+        it stays but does nothing there until the creator runs /servers allow or leave.
+        """
+        access = self.servers.servers.get(guild.id)
+        if access is not None and access.allowed:
+            return
+        if not self.owner_ids:
+            return  # creator unknown; decide on the next connect
+        adder = await self.find_adder(guild)
+        adder_id = adder.id if adder is not None else None
+        adder_name = str(adder) if adder is not None else ""
+        if adder_id in self.owner_ids:
+            why = "added by the creator"
+        elif guild.owner_id in self.owner_ids:
+            why = "the creator owns this server"
+        elif first_run:
+            why = "was already in it before the creator-only rule"
+        else:
+            why = ""
+        if why:
+            self.servers.set(guild.id, ServerAccess(True, why, adder_id, adder_name))
+            log.info("Server %s (%s): working here, %s", guild, guild.id, why)
+            return
+        if adder is not None:
+            log.warning(
+                "Server %s (%s): added by %s (%s), not the creator; leaving",
+                guild,
+                guild.id,
+                adder,
+                adder_id,
+            )
+            await self.tell_owners(
+                f"{adder} (`{adder_id}`) added me to **{guild}** (`{guild.id}`), so I left it. "
+                "I only work in servers you add me to."
+            )
+            await guild.leave()
+            return
+        log.warning(
+            "Server %s (%s): cannot tell who added the bot; waiting for /servers allow",
+            guild,
+            guild.id,
+        )
+        if access is None:  # tell the creator only once
+            self.servers.set(guild.id, ServerAccess(False, "waiting for the creator"))
+            await self.tell_owners(
+                f"I joined **{guild}** (`{guild.id}`) but cannot tell who added me, so I do "
+                "nothing there yet. Give me **View Audit Log** there so I can check, or "
+                "run `/servers allow` or `/servers leave` here."
+            )
+
+    async def tell_owners(self, text: str) -> None:
+        """Send the creator a direct message."""
+        for owner_id in self.owner_ids:
+            try:
+                user = self.get_user(owner_id) or await self.fetch_user(owner_id)
+                await user.send(text, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException as exc:
+                log.warning("Could not message the creator %s (HTTP %s)", owner_id, exc.status)
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        log.info("Added to server %s (%s)", guild, guild.id)
+        await self.check_server(guild)
+
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        # If the bot is added again, check again who added it.
+        log.info("Removed from server %s (%s)", guild, guild.id)
+        if guild.id in self.servers.servers:
+            self.servers.set(guild.id, None)
+
+    async def check_servers(self) -> None:
+        if not self.owner_ids:
+            await self.load_owners()
+        if not self.owner_ids:
+            log.error("Creator unknown, so the bot does nothing in servers not yet allowed.")
+            return
+        log.info("Creator: %s", ", ".join(str(i) for i in sorted(self.owner_ids)))
+        if self.bot_public:
+            log.warning(
+                "Public Bot is on, so anyone can add the bot; it leaves servers others add "
+                "it to. Turn it off in the Developer Portal under Bot to stop that."
+            )
+        first_run = self.servers.first_run
+        for guild in list(self.guilds):
+            try:
+                await self.check_server(guild, first_run=first_run)
+            except discord.HTTPException:
+                log.exception("Server %s: could not check who added the bot", guild.id)
+        if self.servers.first_run:
+            self.servers.save()
+
     async def on_ready(self) -> None:
         # Problems here are logged, not fatal: admins fix them with /logchannel set.
         log.info("Logged in as %s in %s server(s)", self.user, len(self.guilds))
+        await self.check_servers()
         if self.text_reader is None:
             log.info("Text in images is not read; set GOOGLE_VISION_API_KEY to turn it on.")
         active = 0
@@ -613,6 +811,8 @@ class ModeratorBot(discord.Client):
         )
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        if not self.is_allowed(payload.guild_id):
+            return
         if payload.message_id in self.removed_ids:
             self.removed_ids.discard(payload.message_id)
             return
@@ -620,6 +820,8 @@ class ModeratorBot(discord.Client):
         await self.log_deletion(payload.guild_id, payload.channel_id, {payload.message_id}, cached)
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        if not self.is_allowed(payload.guild_id):
+            return
         # Leave out messages this bot removed itself; they have their own log.
         message_ids = payload.message_ids - self.removed_ids
         self.removed_ids -= payload.message_ids
@@ -699,7 +901,12 @@ class ModeratorBot(discord.Client):
 
     async def log_edit(self, before: discord.Message | None, after: discord.Message) -> None:
         # Bots, including this one, edit their own posts constantly; skip them.
-        if after.guild is None or after.author.bot or not self.is_text_edit(before, after):
+        if (
+            after.guild is None
+            or not self.is_allowed(after.guild.id)
+            or after.author.bot
+            or not self.is_text_edit(before, after)
+        ):
             return
         channel = self.log_channel_for(after.guild.id)
         if channel is None or after.channel.id == channel.id:
@@ -778,6 +985,8 @@ class ModeratorBot(discord.Client):
         return trap if trap is not None and message.channel.id == trap.channel_id else None
 
     async def on_message(self, message: discord.Message) -> None:
+        if message.guild is None or not self.is_allowed(message.guild.id):
+            return
         if await self.enforce_long_timeout(message):
             return
         if (trap := self.trap_for(message)) is not None:
@@ -1059,6 +1268,8 @@ class ModeratorBot(discord.Client):
         for key, entry in list(self.long_timeouts.entries.items()):
             if entry.left or entry.applied_until - now > RENEW_BEFORE:
                 continue
+            if not self.is_allowed(key[0]):
+                continue
             guild = self.get_guild(key[0])
             if guild is None:
                 continue  # not connected to that server right now; try again later
@@ -1134,6 +1345,8 @@ class ModeratorBot(discord.Client):
     # Members joining and leaving
 
     async def on_member_join(self, member: discord.Member) -> None:
+        if not self.is_allowed(member.guild.id):
+            return
         key = (member.guild.id, member.id)
         if (entry := self.long_timeouts.entries.get(key)) is not None and self.claim(
             self.reapplied, key
@@ -1161,6 +1374,8 @@ class ModeratorBot(discord.Client):
         await self.send_member_log(channel, embed)
 
     async def on_raw_member_remove(self, payload: discord.RawMemberRemoveEvent) -> None:
+        if not self.is_allowed(payload.guild_id):
+            return
         channel = self.member_log_channel_for(payload.guild_id, "leave")
         if channel is None:
             return
@@ -1477,6 +1692,202 @@ async def timeouts_command(interaction: discord.Interaction) -> None:
     if partial:
         embed.set_footer(text=note.strip())
     await reply(interaction, "", embed=embed)
+
+
+class CommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Server commands work only in servers the creator added or allowed the bot to."""
+        bot: ModeratorBot = interaction.client
+        if interaction.guild_id is None or bot.is_allowed(interaction.guild_id):
+            return True
+        if interaction.type is discord.InteractionType.application_command:
+            await reply(interaction, "My creator has not allowed me to work in this server.")
+        return False
+
+
+# Creator-only commands, used in a direct message with the bot.
+CREATOR_DM = {
+    "allowed_contexts": app_commands.AppCommandContext(
+        guild=False, dm_channel=True, private_channel=False
+    ),
+    "allowed_installs": app_commands.AppInstallationType(guild=True, user=False),
+}
+
+
+async def creator_only(interaction: discord.Interaction) -> bool:
+    bot: ModeratorBot = interaction.client
+    if interaction.user.id in bot.owner_ids:
+        return True
+    await reply(interaction, "Only my creator can use this command.")
+    return False
+
+
+def server_line(guild: discord.Guild, access: ServerAccess | None) -> str:
+    if access is None:
+        status = "not checked yet"
+    elif access.allowed:
+        status = f"working ({access.why})"
+    else:
+        status = "**doing nothing**, waiting for `/servers allow` or `/servers leave`"
+    if access is not None and access.added_by is not None:
+        name = f" {shorten(access.added_by_name, 60)}" if access.added_by_name else ""
+        added_by = f"<@{access.added_by}>{name} (`{access.added_by}`)"
+    else:
+        added_by = "unknown (give me View Audit Log there to find out)"
+    owner = f"<@{guild.owner_id}>" if guild.owner_id else "unknown"
+    joined = (
+        discord.utils.format_dt(guild.me.joined_at, "R")
+        if guild.me is not None and guild.me.joined_at is not None
+        else "unknown"
+    )
+    members = f"{guild.member_count:,}" if guild.member_count else "?"
+    return (
+        f"**{shorten(guild.name, 100)}** (`{guild.id}`) · {members} members\n"
+        f"Added by {added_by} {joined} · Owner {owner}\n"
+        f"Status: {status}"
+    )
+
+
+async def server_choices(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    bot: ModeratorBot = interaction.client
+    if interaction.user.id not in bot.owner_ids:
+        return []
+    text = current.lower()
+    return [
+        app_commands.Choice(name=shorten(f"{guild.name} ({guild.id})", 100), value=str(guild.id))
+        for guild in sorted(bot.guilds, key=lambda g: g.name.lower())
+        if text in guild.name.lower() or text in str(guild.id)
+    ][:25]
+
+
+class ServerCommands(app_commands.Group, name="servers", description="The servers I am in"):
+    def __init__(self, bot: ModeratorBot) -> None:
+        super().__init__(**CREATOR_DM)
+        self.bot = bot
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await creator_only(interaction)
+
+    def server(self, value: str) -> discord.Guild | None:
+        return self.bot.get_guild(int(value)) if value.strip().isdigit() else None
+
+    @app_commands.command(name="list", description="List my servers and who added me to each")
+    async def list_servers(self, interaction: discord.Interaction) -> None:
+        await acknowledge(interaction)
+        bot = self.bot
+        blocks = []
+        for guild in sorted(bot.guilds, key=lambda g: g.name.lower()):
+            access = bot.servers.servers.get(guild.id)
+            if access is not None and access.added_by is None:
+                # Try again: the bot may have been given the permission since.
+                try:
+                    adder = await bot.find_adder(guild)
+                except discord.HTTPException:
+                    adder = None
+                if adder is not None:
+                    access = replace(access, added_by=adder.id, added_by_name=str(adder))
+                    bot.servers.set(guild.id, access)
+            blocks.append(server_line(guild, access))
+        if bot.bot_public:
+            public = (
+                "Public Bot is **on**: anyone can add me, and I leave servers that others "
+                "add me to. Turn it off in the Developer Portal under **Bot**."
+            )
+        else:
+            public = "Public Bot is off: only you can add me."
+        header = f"I am in {len(blocks)} server(s). {public}"
+        if not blocks:
+            await reply(interaction, header)
+            return
+        body = fit_lines(blocks, 1990 - len(header)).replace("\n**", "\n\n**")
+        await reply(interaction, f"{header}\n\n{body}")
+
+    @app_commands.command(name="allow", description="Let me work in a server")
+    @app_commands.describe(server="The server, by name or ID")
+    @app_commands.autocomplete(server=server_choices)
+    async def allow(self, interaction: discord.Interaction, server: str) -> None:
+        guild = self.server(server)
+        if guild is None:
+            await reply(interaction, "I am not in that server. Pick one from the list.")
+            return
+        old = self.bot.servers.servers.get(guild.id)
+        if old is not None and old.allowed:
+            await reply(interaction, f"I already work in **{guild}**.")
+            return
+        self.bot.servers.set(
+            guild.id,
+            ServerAccess(
+                True,
+                "allowed by the creator",
+                old.added_by if old else None,
+                old.added_by_name if old else "",
+            ),
+        )
+        log.info("Server %s (%s): allowed by the creator", guild, guild.id)
+        await reply(interaction, f"I now work in **{guild}** (`{guild.id}`).")
+
+    @app_commands.command(name="leave", description="Make me leave a server")
+    @app_commands.describe(server="The server, by name or ID")
+    @app_commands.autocomplete(server=server_choices)
+    async def leave(self, interaction: discord.Interaction, server: str) -> None:
+        guild = self.server(server)
+        if guild is None:
+            await reply(interaction, "I am not in that server. Pick one from the list.")
+            return
+        await acknowledge(interaction)
+        try:
+            await guild.leave()
+        except discord.HTTPException as exc:
+            await reply(
+                interaction, f"Discord did not let me leave **{guild}** (HTTP {exc.status})."
+            )
+            return
+        self.bot.servers.set(guild.id, None)
+        log.info("Server %s (%s): left at the creator's request", guild, guild.id)
+        await reply(interaction, f"I left **{guild}** (`{guild.id}`).")
+
+
+def ocr_quota_text(reader: scam_filter.GoogleVisionReader | None) -> str:
+    if reader is None:
+        return "Reading text in images is off, because `GOOGLE_VISION_API_KEY` is not set."
+    usage = reader.usage
+    now = datetime.now(UTC)
+    used = usage.used(now)
+    month = now.astimezone(scam_filter.BILLING_ZONE).strftime("%B %Y")
+    resets = discord.utils.format_dt(usage.resets_at(now), "R")
+    if usage.limit:
+        left = max(usage.limit - used, 0)
+        lines = [
+            f"**Google Vision, {month}:** {used:,} of {usage.limit:,} images read, "
+            f"**{left:,} left**.",
+        ]
+        if not left:
+            lines.append("The limit is reached, so images are not read until the count resets.")
+    else:
+        lines = [f"**Google Vision, {month}:** {used:,} images read (no monthly limit set)."]
+    lines.append(f"The count resets {resets} (Pacific time, like Google's billing month).")
+    if (pause := reader.paused_until - time.monotonic()) > 0:
+        until = discord.utils.format_dt(now + timedelta(seconds=pause), "R")
+        lines.append(f"Paused after failed requests; reading starts again {until}.")
+    lines.append(
+        "This counts the images I sent. Google's own count is higher if the key is used "
+        "elsewhere too. A repost of an image I already read is free."
+    )
+    return "\n".join(lines)
+
+
+@app_commands.command(name="ocrquota", description="How many images I can still read this month")
+async def ocr_quota_command(interaction: discord.Interaction) -> None:
+    if not await creator_only(interaction):
+        return
+    bot: ModeratorBot = interaction.client
+    await reply(interaction, ocr_quota_text(bot.text_reader))
+
+
+ocr_quota_command.allowed_contexts = CREATOR_DM["allowed_contexts"]
+ocr_quota_command.allowed_installs = CREATOR_DM["allowed_installs"]
 
 
 class LogChannelCommands(

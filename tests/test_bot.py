@@ -16,6 +16,8 @@ from bot import (
     LongTimeoutStore,
     MemberLogStore,
     ModeratorBot,
+    ServerAccess,
+    ServerStore,
     Settings,
     Trap,
     TrapStore,
@@ -44,6 +46,9 @@ def notice_parts(view):
     return text, button
 
 
+CREATOR = 7
+
+
 def make_bot(test, send, **settings):
     """A bot whose server 1 logs to channel 999, with settings saved in a temp folder."""
     folder = tempfile.TemporaryDirectory()
@@ -52,6 +57,10 @@ def make_bot(test, send, **settings):
     channel = text_channel(send)
     bot.get_channel = MagicMock(side_effect=lambda cid: channel if cid == channel.id else None)
     bot.store.channels = {1: 999}
+    # The creator is user 7 and allowed servers 1 and 2.
+    bot.owner_ids = frozenset({CREATOR})
+    for guild_id in (1, 2):
+        bot.servers.set(guild_id, ServerAccess(True, "added by the creator", CREATOR))
     return bot, channel
 
 
@@ -1518,3 +1527,252 @@ class StartupTests(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             bot_module.main()
+
+
+class Named(SimpleNamespace):
+    def __str__(self):
+        return self.name
+
+
+def guild(guild_id=5, *, owner_id=100, manage_guild=False, view_audit_log=False):
+    return Named(
+        id=guild_id,
+        name=f"Server {guild_id}",
+        owner_id=owner_id,
+        member_count=12,
+        me=SimpleNamespace(
+            guild_permissions=SimpleNamespace(
+                manage_guild=manage_guild, view_audit_log=view_audit_log
+            ),
+            joined_at=datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+        integrations=AsyncMock(return_value=[]),
+        audit_logs=MagicMock(),
+        leave=AsyncMock(),
+    )
+
+
+def user(user_id, name="someone"):
+    return Named(id=user_id, name=name)
+
+
+class ServerStoreTests(unittest.TestCase):
+    def test_saves_and_loads_servers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "servers.json"
+            store = ServerStore(path)
+            self.assertTrue(store.first_run)
+            store.set(5, ServerAccess(True, "added by the creator", 7, "creator"))
+            store.set(6, ServerAccess(False, "waiting for the creator"))
+            loaded = ServerStore(path)
+            self.assertFalse(loaded.first_run)
+            self.assertTrue(loaded.allowed(5))
+            self.assertFalse(loaded.allowed(6))
+            self.assertFalse(loaded.allowed(None))
+            self.assertEqual(loaded.servers[5].added_by_name, "creator")
+            loaded.set(5, None)
+            self.assertEqual(set(ServerStore(path).servers), {6})
+
+    def test_broken_file_stops_startup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "servers.json"
+            path.write_text("[1]", "utf-8")
+            with self.assertRaises(ValueError):
+                ServerStore(path)
+
+
+class CreatorOnlyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.bot, _ = make_bot(self, AsyncMock())
+        self.bot.tell_owners = AsyncMock()
+        self.bot._connection.application_id = 900
+        self.bot._connection.user = SimpleNamespace(id=900)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def told(self):
+        return " ".join(c.args[0] for c in self.bot.tell_owners.await_args_list)
+
+    async def test_works_where_the_creator_added_it(self):
+        server = guild(manage_guild=True)
+        server.integrations.return_value = [
+            MagicMock(
+                spec=discord.BotIntegration,
+                application=SimpleNamespace(id=900),
+                user=user(CREATOR, "creator"),
+            )
+        ]
+        await self.bot.check_server(server)
+        self.assertTrue(self.bot.is_allowed(5))
+        access = ServerStore(self.bot.servers.path).servers[5]
+        self.assertEqual((access.added_by, access.added_by_name), (CREATOR, "creator"))
+        server.leave.assert_not_awaited()
+
+    async def test_leaves_a_server_someone_else_added_it_to(self):
+        server = guild(view_audit_log=True)
+        entries = [
+            SimpleNamespace(target=SimpleNamespace(id=1234), user=user(1)),
+            SimpleNamespace(target=SimpleNamespace(id=900), user=user(55, "stranger")),
+        ]
+
+        async def audit_logs(**kwargs):
+            self.assertEqual(kwargs["action"], discord.AuditLogAction.bot_add)
+            for entry in entries:
+                yield entry
+
+        server.audit_logs = audit_logs
+        with self.assertLogs("bot", level="WARNING"):
+            await self.bot.check_server(server)
+        server.leave.assert_awaited_once()
+        self.assertFalse(self.bot.is_allowed(5))
+        self.assertNotIn(5, self.bot.servers.servers)
+        self.assertIn("stranger (`55`)", self.told())
+
+    async def test_works_in_the_creators_own_server(self):
+        await self.bot.check_server(guild(owner_id=CREATOR))
+        self.assertTrue(self.bot.is_allowed(5))
+
+    async def test_waits_for_the_creator_when_the_adder_is_unknown(self):
+        server = guild()
+        with self.assertLogs("bot", level="WARNING"):
+            await self.bot.check_server(server)
+            await self.bot.check_server(server)  # e.g. after a restart
+        server.leave.assert_not_awaited()
+        self.assertFalse(self.bot.is_allowed(5))
+        self.assertEqual(self.bot.tell_owners.await_count, 1)  # told only once
+        self.assertIn("/servers allow", self.told())
+
+        message = post(member(), guild_id=5)
+        message.guild.id = 5
+        self.bot.enforce_long_timeout = AsyncMock()
+        await self.bot.on_message(message)
+        self.bot.enforce_long_timeout.assert_not_awaited()
+
+    async def test_servers_it_was_already_in_keep_working(self):
+        self.bot.servers = ServerStore(self.bot.servers.path.with_name("new.json"))
+        await self.bot.check_server(guild(), first_run=True)
+        self.assertTrue(self.bot.is_allowed(5))
+        self.bot.tell_owners.assert_not_awaited()
+
+    async def test_check_servers_saves_the_file_even_with_no_servers(self):
+        self.bot.servers = ServerStore(self.bot.servers.path.with_name("new.json"))
+        with patch.object(type(self.bot), "guilds", new_callable=PropertyMock) as guilds:
+            guilds.return_value = []
+            with self.assertLogs("bot", level="INFO"):
+                await self.bot.check_servers()
+        self.assertTrue(self.bot.servers.path.exists())
+        self.assertFalse(ServerStore(self.bot.servers.path).first_run)
+
+    async def test_removal_forgets_the_server(self):
+        with self.assertLogs("bot", level="INFO"):
+            await self.bot.on_guild_remove(SimpleNamespace(id=1))
+        self.assertFalse(self.bot.is_allowed(1))
+
+    async def test_server_commands_are_refused_where_not_allowed(self):
+        action = interaction(guild_id=5)
+        action.type = discord.InteractionType.application_command
+        action.client = self.bot
+        self.assertFalse(await self.bot.tree.interaction_check(action))
+        self.assertIn("not allowed", answer_text(self, action))
+        allowed = interaction(guild_id=1)
+        allowed.client = self.bot
+        self.assertTrue(await self.bot.tree.interaction_check(allowed))
+
+
+class CreatorCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.bot, _ = make_bot(self, AsyncMock())
+        self.servers = self.bot.tree.get_command("servers")
+        self.guilds = [guild(1), guild(5)]
+        patcher = patch.object(type(self.bot), "guilds", new_callable=PropertyMock)
+        patcher.start().return_value = self.guilds
+        self.addCleanup(patcher.stop)
+        self.bot.get_guild = lambda gid: next((g for g in self.guilds if g.id == gid), None)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    def dm(self, user_id=CREATOR):
+        action = interaction()
+        action.guild, action.guild_id = None, None
+        action.user = SimpleNamespace(id=user_id)
+        action.client = self.bot
+        return action
+
+    async def run_command(self, name, action, *args):
+        await self.servers.get_command(name).callback(self.servers, action, *args)
+
+    def test_commands_are_only_in_direct_messages(self):
+        for command in (self.servers, self.bot.tree.get_command("ocrquota")):
+            data = command.to_dict(self.bot.tree)
+            self.assertEqual(data["contexts"], [1])  # the bot's DMs
+            self.assertEqual(data["integration_types"], [0])
+        names = {c["name"] for c in self.servers.to_dict(self.bot.tree)["options"]}
+        self.assertEqual(names, {"list", "allow", "leave"})
+
+    async def test_only_the_creator_may_use_them(self):
+        action = self.dm(user_id=55)
+        self.assertFalse(await self.servers.interaction_check(action))
+        self.assertIn("Only my creator", answer_text(self, action))
+        self.assertTrue(await self.servers.interaction_check(self.dm()))
+
+        action = self.dm(user_id=55)
+        await self.bot.tree.get_command("ocrquota").callback(action)
+        self.assertIn("Only my creator", answer_text(self, action))
+        self.assertEqual(await bot_module.server_choices(self.dm(user_id=55), ""), [])
+
+    async def test_list_shows_who_added_it_and_status(self):
+        self.bot.bot_public = True
+        self.bot.servers.set(5, ServerAccess(False, "waiting for the creator"))
+        action = self.dm()
+        await self.run_command("list", action)
+        text = answer_text(self, action)
+        self.assertIn("2 server(s)", text)
+        self.assertIn("Public Bot is **on**", text)
+        self.assertIn("**Server 1** (`1`) · 12 members", text)
+        self.assertIn(f"Added by <@{CREATOR}>", text)
+        self.assertIn("working (added by the creator)", text)
+        self.assertIn("unknown (give me View Audit Log", text)
+        self.assertIn("**doing nothing**", text)
+        self.assertIn("Owner <@100>", text)
+
+    async def test_server_choices_match_name_or_id(self):
+        choices = await bot_module.server_choices(self.dm(), "server 5")
+        self.assertEqual([c.value for c in choices], ["5"])
+
+    async def test_allow_and_leave(self):
+        self.bot.servers.set(5, ServerAccess(False, "waiting for the creator"))
+        action = self.dm()
+        with self.assertLogs("bot", level="INFO"):
+            await self.run_command("allow", action, "5")
+        self.assertIn("I now work in", answer_text(self, action))
+        self.assertTrue(ServerStore(self.bot.servers.path).allowed(5))
+
+        action = self.dm()
+        with self.assertLogs("bot", level="INFO"):
+            await self.run_command("leave", action, "5")
+        self.guilds[1].leave.assert_awaited_once()
+        self.assertIn("I left", answer_text(self, action))
+        self.assertNotIn(5, ServerStore(self.bot.servers.path).servers)
+
+        action = self.dm()
+        await self.run_command("allow", action, "999")
+        self.assertIn("not in that server", answer_text(self, action))
+
+    async def test_ocr_quota(self):
+        action = self.dm()
+        await self.bot.tree.get_command("ocrquota").callback(action)
+        self.assertIn("GOOGLE_VISION_API_KEY", answer_text(self, action))
+
+        reader = scam_filter.GoogleVisionReader("key", None, 1000)
+        self.addAsyncCleanup(reader.close)
+        for _ in range(4):
+            reader.usage.add()
+        text = bot_module.ocr_quota_text(reader)
+        self.assertIn("4 of 1,000 images read, **996 left**", text)
+        self.assertIn("resets <t:", text)
+        reader.usage.limit = 4
+        self.assertIn("limit is reached", bot_module.ocr_quota_text(reader))
+        reader.usage.limit = 0
+        self.assertIn("no monthly limit", bot_module.ocr_quota_text(reader))

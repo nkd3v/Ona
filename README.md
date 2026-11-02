@@ -20,6 +20,9 @@ A Python bot for Discord servers that:
   choose. See [Join and leave logs](#join-and-leave-logs).
 - adds `/timeout` for any length, from minutes to years or permanent, beyond
   Discord's 28-day limit, and `/timeouts` to list who is timed out. See [Long and permanent timeouts](#long-and-permanent-timeouts).
+- works only in servers its creator added it to, and lets the creator list its servers
+  and check the image reading quota in a direct message. See
+  [Creator only](#creator-only).
 
 ## Setup
 
@@ -28,11 +31,13 @@ A Python bot for Discord servers that:
    In **Bot**, obtain a bot token and enable **Message Content Intent** and
    **Server Members Intent** under **Privileged Gateway Intents**. Keep the token
    private. Server Members Intent is only needed for join and leave logs.
+   Turn off **Public Bot** so that only you can add the bot to servers. See
+   [Creator only](#creator-only).
 3. Use **OAuth2 → URL Generator** with the `bot` and `applications.commands` scopes to
    invite it to your server.
    Give it **View Channels**, **Send Messages**, **Embed Links**, **Read Message History**,
-   **Manage Messages**, and **Timeout Members** (use **Kick Members** or **Ban Members** instead if you change
-   `SCAM_ACTION`). In a private moderator log channel, also grant **Send Messages**,
+   **Manage Messages**, **View Audit Log**, and **Timeout Members** (use **Kick Members** or **Ban Members** instead if you change
+   `SCAM_ACTION`). View Audit Log lets the bot see who added it. In a private moderator log channel, also grant **Send Messages**,
    **Embed Links**, and **Attach Files**. Administrator is unnecessary.
    In **Server Settings → Roles**, drag the bot's role above the roles of the members
    it should time out. Discord does not let a bot act on members with equal or
@@ -206,6 +211,42 @@ if your server talks about it. Images posted by moderators are never checked.
 Images sent for reading leave your server and go to Google. Google's
 [data usage terms](https://cloud.google.com/vision/docs/data-usage) say it keeps them
 only briefly while reading them and does not use them for anything else.
+
+The bot's creator can run `/ocrquota` in a direct message with the bot to see how many
+images it read this month, how many are left and when the count resets.
+
+## Creator only
+
+The bot works only in servers its creator added it to. The creator is the owner of
+the application in the Discord Developer Portal, or the members of its team.
+
+When the bot joins a server, it looks up who added it, in the server's integrations
+(with **Manage Server**) or audit log (with **View Audit Log**):
+
+- the creator added it, or the creator owns the server: it works there.
+- someone else added it: it sends the creator a direct message and leaves.
+- it cannot tell: it stays but does nothing there, and asks the creator in a direct
+  message to allow it or make it leave. Server commands answer that the bot is not
+  allowed there.
+
+Servers the bot was already in when this rule was added keep working. The decisions
+are saved in `DATA_DIR/servers.json`.
+
+To stop strangers adding the bot at all, turn off **Public Bot** in the Developer
+Portal under **Bot**. The bot logs a warning at startup while it is on.
+
+The creator can run these commands in a direct message with the bot. They do not
+appear in servers, and the bot refuses them from anyone else.
+
+| Command | What it does |
+| --- | --- |
+| `/servers list` | List the bot's servers: member count, owner, who added the bot and when, and whether it works there |
+| `/servers allow server:` | Let the bot work in a server where it could not tell who added it |
+| `/servers leave server:` | Make the bot leave a server |
+| `/ocrquota` | Show how many images it read this month with Google Vision and how many are left |
+
+To open a direct message, click the bot's name in a server you share with it and
+send it a message, then type `/`.
 
 ## Trap channel
 

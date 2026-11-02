@@ -181,6 +181,18 @@ class MonthlyUsage:
         self._roll(now)
         return 0 < self.limit <= self.count
 
+    def used(self, now: datetime | None = None) -> int:
+        """Images sent to Google so far this billing month."""
+        self._roll(now)
+        return self.count
+
+    @staticmethod
+    def resets_at(now: datetime | None = None) -> datetime:
+        """When the next billing month starts and the count goes back to 0."""
+        local = (now or datetime.now(UTC)).astimezone(BILLING_ZONE)
+        year, month = (local.year + 1, 1) if local.month == 12 else (local.year, local.month + 1)
+        return datetime(year, month, 1, tzinfo=BILLING_ZONE)
+
     def add(self, now: datetime | None = None) -> None:
         self._roll(now)
         self.count += 1

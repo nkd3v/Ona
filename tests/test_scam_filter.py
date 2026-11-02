@@ -210,6 +210,14 @@ class GoogleVisionReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(usage.used_up(datetime(2026, 12, 1, 9, tzinfo=UTC)))
         self.assertFalse(sf.MonthlyUsage(None, 0).used_up())  # 0: no limit
 
+    def test_usage_count_and_reset_time(self):
+        usage = sf.MonthlyUsage(None, 10)
+        usage.add(datetime(2026, 12, 20, tzinfo=UTC))
+        self.assertEqual(usage.used(datetime(2026, 12, 21, tzinfo=UTC)), 1)
+        self.assertEqual(usage.used(datetime(2027, 1, 2, tzinfo=UTC)), 0)
+        reset = sf.MonthlyUsage.resets_at(datetime(2026, 12, 20, tzinfo=UTC))
+        self.assertEqual(reset, datetime(2027, 1, 1, 8, tzinfo=UTC))
+
     def test_unreadable_usage_file_starts_from_zero(self):
         self.usage_path.write_text("{broken", "utf-8")
         with self.assertLogs("scam_filter", level="WARNING"):

@@ -41,8 +41,8 @@ KNOWN_SCAM_IMAGES = {
 }
 DEFAULT_BLOCKED_DOMAINS = ("wispwin.com", "fapwin.com")
 # Images whose text contains any of these words are scams. Spaces, punctuation and case
-# are ignored, and a word also matches inside a longer one ("crypto" in "cryptocurrency").
-DEFAULT_SCAM_WORDS = ("mrbeast", "crypto", "casino")
+# are ignored, and a word also matches inside a longer one ("casino" in "casinos").
+DEFAULT_SCAM_WORDS = ("mrbeast", "casino")
 
 VISION_URL = "https://vision.googleapis.com/v1/images:annotate"
 OCR_MAX_BYTES = 1024 * 1024  # keeps uploads quick; Google allows much larger

@@ -146,7 +146,7 @@ deletes it when:
    `fapwin.com`).
 3. **The text in an image contains a scam word or a blocked domain** (only with an
    OCR key, see [Reading text in images](#reading-text-in-images)). The default words
-   are `mrbeast`, `crypto` and `casino`.
+   are `mrbeast` and `casino`.
 4. **One person posts the same files or link in 3 channels within 2 minutes**, which
    is how hacked accounts usually spam. Every copy is deleted. Plain text without a
    file or link is never counted, so normal chat is left alone.
@@ -206,8 +206,8 @@ images for 5 minutes and logs a warning. The other checks keep working either wa
 
 `SCAM_IMAGE_WORDS` sets the words, separated by commas. Case, spaces and punctuation
 are ignored, so `mrbeast` also matches "Mr. Beast", and a word also matches inside a
-longer word, so `crypto` matches "cryptocurrency". Any image mentioning these words
-is removed, including harmless ones such as a crypto price chart, so remove a word
+longer word, so `casino` matches "casinos". Any image mentioning these words
+is removed, including harmless ones such as a casino game screenshot, so remove a word
 if your server talks about it. Images posted by moderators are never checked.
 
 Images sent for reading leave your server and go to Google. Google's

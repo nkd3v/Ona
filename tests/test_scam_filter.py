@@ -83,7 +83,8 @@ class ScamWordTests(unittest.TestCase):
         words = sf.DEFAULT_SCAM_WORDS
         self.assertEqual(sf.find_word("MrBeast (@MrBeast) / X", words), "mrbeast")
         self.assertEqual(sf.find_word("Mr. Beast giveaway", words), "mrbeast")
-        self.assertEqual(sf.find_word("my own CRYPTOCURRENCY", words), "crypto")
+        self.assertEqual(sf.find_word("online\nCASINOS", words), "casino")
+        self.assertIsNone(sf.find_word("my own CRYPTOCURRENCY", words))
         self.assertEqual(sf.find_word("online\nCasino", words), "casino")
         self.assertIsNone(sf.find_word("Withdrawal successful, USDC", words))
         self.assertIsNone(sf.find_word("anything", ["", " "]))

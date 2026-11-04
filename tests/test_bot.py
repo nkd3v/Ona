@@ -102,7 +102,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.scam_images_dir, bot_module.BASE_DIR / "scam-images")
         self.assertEqual(settings.vision_api_key, "")
         self.assertEqual(settings.vision_monthly_limit, 1000)
-        self.assertEqual(settings.scam_words, ("mrbeast", "crypto", "casino"))
+        self.assertEqual(settings.scam_words, ("mrbeast", "casino"))
         settings = Settings.from_env(
             base
             | {
